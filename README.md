@@ -8,6 +8,7 @@ AD4M link language that syncs Perspective triples to Matrix rooms via the Client
 - **Sync:** polls room timeline for new events → local links
 - **Query:** indexed local store (source, target, predicate)
 - **Dual rendering:** each link becomes both a typed custom event and a human-readable `m.room.message`, so Matrix clients display meaningful content alongside structured data
+- **Telepresence:** real-time presence via Matrix Presence API, peer-to-peer signalling via to-device messages, broadcast via room events
 
 ## Template Variables
 
@@ -35,7 +36,7 @@ Requires `@coasys/ad4m-ldk` at `../ad4m/ad4m-ldk/js/` or set `AD4M_LDK_ENTRY`.
 node --experimental-vm-modules --import tsx --test tests/*.test.ts
 ```
 
-255 tests across 10 suites.
+297 tests across 11 suites.
 
 ## Architecture
 
