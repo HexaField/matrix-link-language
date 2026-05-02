@@ -14,7 +14,7 @@ const ad4mLdkAliasPlugin = {
       external: true,
     }));
     build.onResolve({ filter: /^@coasys\/ad4m-ldk$/ }, () => ({
-      path: ad4mLdkEntry,
+      path: resolve(projectRoot, ad4mLdkEntry),
       namespace: "file",
     }));
   },
