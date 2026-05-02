@@ -33,6 +33,10 @@ export interface MatrixSyncResponse {
         invite?: Record<string, unknown>;
         leave?: Record<string, unknown>;
     };
+    /** To-device messages delivered during this sync batch. */
+    to_device?: {
+        events: MatrixEvent[];
+    };
 }
 
 export interface MatrixJoinedRoom {
@@ -231,13 +235,37 @@ export function buildTypingUrl(
 }
 
 /**
- * Build the presence URL.
+ * Build the presence URL (for setting own presence).
  */
 export function buildPresenceUrl(
     homeserverUrl: string,
     userId: string,
 ): string {
     return `${homeserverUrl}/_matrix/client/v3/presence/${encodeURIComponent(userId)}/status`;
+}
+
+/**
+ * Build the presence URL for *getting* another user's presence.
+ * (Same endpoint, but used with GET instead of PUT.)
+ */
+export function buildGetPresenceUrl(
+    homeserverUrl: string,
+    userId: string,
+): string {
+    return `${homeserverUrl}/_matrix/client/v3/presence/${encodeURIComponent(userId)}/status`;
+}
+
+/**
+ * Build the send-to-device URL.
+ *
+ * PUT /_matrix/client/v3/sendToDevice/{eventType}/{txnId}
+ */
+export function buildSendToDeviceUrl(
+    homeserverUrl: string,
+    eventType: string,
+    txnId: string,
+): string {
+    return `${homeserverUrl}/_matrix/client/v3/sendToDevice/${encodeURIComponent(eventType)}/${encodeURIComponent(txnId)}`;
 }
 
 /**

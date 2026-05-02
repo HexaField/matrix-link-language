@@ -17,6 +17,8 @@ import {
     buildMessagesUrl,
     buildTypingUrl,
     buildPresenceUrl,
+    buildGetPresenceUrl,
+    buildSendToDeviceUrl,
     buildAuthHeaders,
     buildDefaultFilter,
     parseLoginResponse,
@@ -163,6 +165,32 @@ describe("buildPresenceUrl", () => {
         const url = buildPresenceUrl(HOMESERVER, "@user:s");
         assert.ok(url.includes("/presence/"));
         assert.ok(url.includes("/status"));
+    });
+});
+
+describe("buildGetPresenceUrl", () => {
+    it("builds get-presence URL (same endpoint, used with GET)", () => {
+        const url = buildGetPresenceUrl(HOMESERVER, "@other:s");
+        assert.ok(url.includes("/presence/"));
+        assert.ok(url.includes("/status"));
+        assert.ok(url.includes(encodeURIComponent("@other:s")));
+    });
+});
+
+describe("buildSendToDeviceUrl", () => {
+    it("builds send-to-device URL", () => {
+        const url = buildSendToDeviceUrl(HOMESERVER, "dev.ad4m.signal", "txn123");
+        assert.ok(url.includes("/sendToDevice/"));
+        assert.ok(url.includes("dev.ad4m.signal"));
+        assert.ok(url.includes("txn123"));
+    });
+
+    it("encodes event type with special characters", () => {
+        const url = buildSendToDeviceUrl(HOMESERVER, "dev.ad4m.signal", "txn1");
+        assert.equal(
+            url,
+            `${HOMESERVER}/_matrix/client/v3/sendToDevice/dev.ad4m.signal/txn1`,
+        );
     });
 });
 

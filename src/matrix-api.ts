@@ -20,6 +20,8 @@ import {
     buildMessagesUrl,
     buildTypingUrl,
     buildPresenceUrl,
+    buildGetPresenceUrl,
+    buildSendToDeviceUrl,
     buildAuthHeaders,
     buildStateUrl,
     parseLoginResponse,
@@ -363,5 +365,46 @@ export async function setPresence(
         authHeaders(),
         JSON.stringify(body),
     );
+    return response.status >= 200 && response.status < 300;
+}
+
+/**
+ * Get presence status for a specific user.
+ */
+export async function getPresence(
+    userId: string,
+): Promise<{ presence: string; last_active_ago?: number; status_msg?: string; currently_active?: boolean } | null> {
+    const url = buildGetPresenceUrl(_homeserverUrl, userId);
+    const response = await getTransport().fetch(url, "GET", authHeaders(), "");
+
+    if (response.status < 200 || response.status >= 300) {
+        return null;
+    }
+
+    try {
+        return JSON.parse(response.body);
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * Send to-device messages.
+ *
+ * PUT /_matrix/client/v3/sendToDevice/{eventType}/{txnId}
+ *
+ * @param eventType - Custom event type, e.g. "dev.ad4m.signal"
+ * @param messages - Map of userId -> deviceId -> content
+ * @param txnId - Transaction ID (auto-generated if omitted)
+ */
+export async function sendToDevice(
+    eventType: string,
+    messages: Record<string, Record<string, Record<string, unknown>>>,
+    txnId?: string,
+): Promise<boolean> {
+    const tid = txnId || generateTxnId();
+    const url = buildSendToDeviceUrl(_homeserverUrl, eventType, tid);
+    const body = JSON.stringify({ messages });
+    const response = await getTransport().fetch(url, "PUT", authHeaders(), body);
     return response.status >= 200 && response.status < 300;
 }

@@ -30,6 +30,7 @@ import type { LinkOrigin } from "./src/dual-language.js";
 import * as store from "./src/store.js";
 import * as matrixApi from "./src/matrix-api.js";
 import { generateTxnId } from "./src/matrix-api.pure.js";
+import type { MatrixEvent } from "./src/matrix-api.pure.js";
 import {
     processSyncResponse,
     processBackfillEvents,
@@ -37,7 +38,7 @@ import {
     setSinceToken,
     extractMembersFromState,
 } from "./src/sync.js";
-import { mxidToDid, parseMemberEvents } from "./src/membership.js";
+import { mxidToDid, didToMxid, parseMemberEvents } from "./src/membership.js";
 
 // Adapter imports (interfaces for singletons, Deno impls for init)
 import { initTransport } from "./src/transport.js";
@@ -83,6 +84,9 @@ let configured: boolean = false;
 let connected: boolean = false;
 /** Guard to prevent concurrent ensureConnected() calls. */
 let connectingPromise: Promise<void> | null = null;
+
+/** Registered telepresence signal callback. */
+let telepresenceSignalCallback: ((payload: unknown) => void) | null = null;
 
 function neighbourhoodUrl(): string {
     return `neighbourhood://${MATRIX_ROOM_ID}`;
@@ -164,6 +168,100 @@ async function ensureConnected(): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// DID ↔ MXID Mapping (for telepresence)
+// ---------------------------------------------------------------------------
+
+const DID_TO_MXID_PREFIX = "did-mxid/";
+const MXID_TO_DID_PREFIX = "mxid-did/";
+
+/**
+ * Store a DID ↔ MXID mapping in both directions.
+ */
+function storeDIDMapping(did: string, mxid: string): void {
+    const storage = getStorage();
+    storage.put(`${DID_TO_MXID_PREFIX}${did}`, mxid);
+    storage.put(`${MXID_TO_DID_PREFIX}${mxid}`, did);
+}
+
+/**
+ * Look up MXID by DID.
+ */
+function getMxidForDid(did: string): string | null {
+    return getStorage().get(`${DID_TO_MXID_PREFIX}${did}`);
+}
+
+/**
+ * Look up DID by MXID.
+ */
+function getDidForMxid(mxid: string): string | null {
+    return getStorage().get(`${MXID_TO_DID_PREFIX}${mxid}`);
+}
+
+/**
+ * Extract the homeserver name from a Matrix user ID.
+ * e.g. "@user:matrix.org" → "matrix.org"
+ */
+function extractServerName(userId: string): string {
+    const match = userId.match(/:(.+)$/);
+    return match ? match[1] : "";
+}
+
+/**
+ * Map an AD4M online status to a Matrix presence state.
+ */
+function mapStatusToPresence(status: unknown): "online" | "offline" | "unavailable" {
+    if (typeof status === "string") {
+        switch (status.toLowerCase()) {
+            case "online": return "online";
+            case "offline": return "offline";
+            case "unavailable":
+            case "away":
+            case "idle":
+                return "unavailable";
+            default:
+                return "online";
+        }
+    }
+    if (typeof status === "object" && status !== null) {
+        const s = status as Record<string, unknown>;
+        if (typeof s.status === "string") return mapStatusToPresence(s.status);
+        if (typeof s.presence === "string") return mapStatusToPresence(s.presence);
+    }
+    return "online";
+}
+
+/**
+ * Process to-device events from a sync response, invoking the
+ * telepresence signal callback for matching event types.
+ */
+function processToDeviceEvents(events: MatrixEvent[]): void {
+    if (!telepresenceSignalCallback) return;
+
+    for (const event of events) {
+        if (event.type === "dev.ad4m.signal" || event.type === "dev.ad4m.broadcast") {
+            const payload = event.content;
+            telepresenceSignalCallback(payload);
+        }
+    }
+}
+
+/**
+ * Process timeline events from a sync response for broadcast signals.
+ * Invokes the telepresence signal callback for dev.ad4m.broadcast room events.
+ */
+function processTimelineBroadcasts(events: MatrixEvent[], myUserId: string): void {
+    if (!telepresenceSignalCallback) return;
+
+    for (const event of events) {
+        if (event.type === "dev.ad4m.broadcast") {
+            // Skip our own broadcasts
+            if (event.sender === myUserId) continue;
+            telepresenceSignalCallback(event.content);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Language definition
 // ---------------------------------------------------------------------------
 
@@ -209,6 +307,7 @@ const language = defineLanguage({
         connected = false;
         configured = false;
         connectingPromise = null;
+        telepresenceSignalCallback = null;
         matrixApi.clearSession();
         console.log("[matrix-link-language] teardown");
     },
@@ -234,6 +333,11 @@ const language = defineLanguage({
 
             // 1. Store links locally
             store.applyDiff(diff);
+
+            // 1b. Store DID ↔ MXID mapping for our commits
+            if (myDid && MATRIX_USER_ID) {
+                storeDIDMapping(myDid, MATRIX_USER_ID);
+            }
 
             // 2. Skip outbound in subscribe-only mode
             if (settings.syncMode === "subscribe-only") {
@@ -332,6 +436,30 @@ const language = defineLanguage({
                 MATRIX_USER_ID,
             );
 
+            // Process to-device events for telepresence signals
+            if (syncResponse.to_device?.events) {
+                processToDeviceEvents(syncResponse.to_device.events);
+            }
+
+            // Process timeline events for broadcast signals
+            const room = syncResponse.rooms?.join?.[MATRIX_ROOM_ID];
+            if (room?.timeline?.events) {
+                processTimelineBroadcasts(room.timeline.events, MATRIX_USER_ID);
+            }
+
+            // Build DID ↔ MXID mappings from incoming link events
+            if (room?.timeline?.events) {
+                for (const event of room.timeline.events) {
+                    if (event.type === "dev.ad4m.link.triple" && event.sender) {
+                        const content = event.content as Record<string, unknown>;
+                        const author = content.author as string;
+                        if (author && event.sender) {
+                            storeDIDMapping(author, event.sender);
+                        }
+                    }
+                }
+            }
+
             // Track origins for inbound links
             for (const link of diff.additions) {
                 const h = store.hashLink(link);
@@ -389,6 +517,122 @@ const language = defineLanguage({
             return store.listPeers("peers/");
         },
     },
+
+    // -----------------------------------------------------------------------
+    // telepresence
+    // -----------------------------------------------------------------------
+    telepresence: {
+        async setOnlineStatus(status: unknown): Promise<void> {
+            if (!configured) return;
+            await ensureConnected();
+
+            const matrixPresence = mapStatusToPresence(status);
+            const statusMsg = typeof status === "object" && status !== null
+                ? (status as Record<string, unknown>).statusMessage as string | undefined
+                : undefined;
+
+            await matrixApi.setPresence(matrixPresence, statusMsg);
+
+            // Also store our own DID ↔ MXID mapping
+            if (myDid && MATRIX_USER_ID) {
+                storeDIDMapping(myDid, MATRIX_USER_ID);
+            }
+        },
+
+        async getOnlineAgents(): Promise<unknown[]> {
+            if (!configured) return [];
+            await ensureConnected();
+
+            // Get room members
+            const memberEvents = await matrixApi.getMembers(MATRIX_ROOM_ID);
+            const members = parseMemberEvents(memberEvents);
+            const joinedMembers = members.filter(m => m.membership === "join");
+
+            const onlineAgents: unknown[] = [];
+
+            for (const member of joinedMembers) {
+                // Skip ourselves
+                if (member.userId === MATRIX_USER_ID) continue;
+
+                // Check presence
+                const presence = await matrixApi.getPresence(member.userId);
+                if (!presence) continue;
+                if (presence.presence !== "online") continue;
+
+                // Resolve DID — check our stored mapping first,
+                // then fall back to the convention-based mxidToDid
+                const did = getDidForMxid(member.userId) || mxidToDid(member.userId);
+
+                onlineAgents.push({
+                    did,
+                    status: {
+                        presence: presence.presence,
+                        lastActiveAgo: presence.last_active_ago,
+                        statusMessage: presence.status_msg,
+                        currentlyActive: presence.currently_active,
+                    },
+                });
+            }
+
+            return onlineAgents;
+        },
+
+        async sendSignal(remoteDid: string, payload: unknown): Promise<object> {
+            if (!configured) return { error: "not configured" };
+            await ensureConnected();
+
+            // Resolve DID → MXID
+            let targetMxid = getMxidForDid(remoteDid);
+            if (!targetMxid) {
+                // Fall back to convention-based mapping
+                const serverName = extractServerName(MATRIX_USER_ID);
+                targetMxid = didToMxid(remoteDid, serverName);
+            }
+
+            // Send via to-device message
+            const content: Record<string, unknown> = {
+                sender_did: myDid,
+                payload,
+                timestamp: new Date().toISOString(),
+            };
+
+            // Send to all devices of the target user ("*" = all devices)
+            const messages: Record<string, Record<string, Record<string, unknown>>> = {
+                [targetMxid]: {
+                    "*": content,
+                },
+            };
+
+            const success = await matrixApi.sendToDevice("dev.ad4m.signal", messages);
+            return { success };
+        },
+
+        async sendBroadcast(payload: unknown): Promise<object> {
+            if (!configured) return { error: "not configured" };
+            await ensureConnected();
+
+            // Send as a room event so all members receive it
+            const content: Record<string, unknown> = {
+                sender_did: myDid,
+                payload,
+                timestamp: new Date().toISOString(),
+            };
+
+            const txnId = generateTxnId();
+            const eventId = await matrixApi.sendEvent(
+                MATRIX_ROOM_ID,
+                "dev.ad4m.broadcast",
+                content,
+                txnId,
+            );
+
+            return { success: !!eventId, eventId };
+        },
+
+        async registerSignalCallback(callback: any): Promise<void> {
+            telepresenceSignalCallback = callback;
+        },
+    },
 });
 
 // ---------------------------------------------------------------------------
@@ -410,6 +654,11 @@ export const {
     perspectiveQueryRun,
     peersSetLocal,
     peersRemote,
+    telepresenceSetOnlineStatus,
+    telepresenceGetOnlineAgents,
+    telepresenceSendSignal,
+    telepresenceSendBroadcast,
+    telepresenceRegisterSignalCallback,
 } = language;
 
 export default language;
