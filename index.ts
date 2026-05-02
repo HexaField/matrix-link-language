@@ -74,9 +74,64 @@ const NEIGHBOURHOOD_META = "<to-be-filled>";
 
 let myDid: string = "";
 let settings: MatrixSettings;
+/** Whether the template variables have been filled with real values. */
+let configured: boolean = false;
+/** Whether we have authenticated and joined the room. */
+let connected: boolean = false;
+/** Guard to prevent concurrent ensureConnected() calls. */
+let connectingPromise: Promise<void> | null = null;
 
 function neighbourhoodUrl(): string {
     return `neighbourhood://${MATRIX_ROOM_ID}`;
+}
+
+/**
+ * Returns true if a template variable still holds its placeholder value.
+ */
+function isPlaceholder(value: string): boolean {
+    return !value || value === "<to-be-filled>";
+}
+
+/**
+ * Lazy connection helper — authenticates and joins the room on first
+ * real operation (commit / sync).  Runs at most once; subsequent calls
+ * are no-ops.
+ */
+async function ensureConnected(): Promise<void> {
+    if (connected || !configured) return;
+    if (connectingPromise) { await connectingPromise; return; }
+
+    connectingPromise = (async () => {
+        try {
+            // Authenticate
+            if (settings.auth.method === "access-token" && settings.auth.accessToken) {
+                matrixApi.loginWithToken(
+                    MATRIX_HOMESERVER_URL,
+                    settings.auth.accessToken,
+                    MATRIX_USER_ID,
+                );
+            } else if (settings.auth.method === "password" && settings.auth.password) {
+                const loginResult = await matrixApi.login(
+                    MATRIX_HOMESERVER_URL,
+                    MATRIX_USER_ID,
+                    settings.auth.password,
+                );
+                if (!loginResult) {
+                    console.error("[matrix-link-language] login failed");
+                    return;
+                }
+            }
+
+            // Join the room
+            await matrixApi.joinRoom(MATRIX_ROOM_ID);
+            connected = true;
+            console.log("[matrix-link-language] connected to Matrix");
+        } finally {
+            connectingPromise = null;
+        }
+    })();
+
+    await connectingPromise;
 }
 
 // ---------------------------------------------------------------------------
@@ -100,35 +155,31 @@ const language = defineLanguage({
         myDid = agentDid();
         settings = parseSettings(languageSettings());
 
+        // Check whether template variables have been filled
+        configured = !isPlaceholder(MATRIX_HOMESERVER_URL) && !isPlaceholder(MATRIX_ROOM_ID);
+
+        if (!configured) {
+            console.warn(
+                "[matrix-link-language] init: template variables not yet filled — " +
+                "language loaded in unconfigured mode (no network ops until configured)",
+            );
+        }
+
         console.log(`[matrix-link-language] init: did=${myDid}, homeserver=${MATRIX_HOMESERVER_URL}`);
         console.log(`[matrix-link-language] room: ${MATRIX_ROOM_ID}`);
+        console.log(`[matrix-link-language] configured: ${configured}`);
         console.log(`[matrix-link-language] sync mode: ${settings.syncMode}`);
         console.log(`[matrix-link-language] rendering: ${settings.rendering.strategy}`);
 
-        // Authenticate
-        if (settings.auth.method === "access-token" && settings.auth.accessToken) {
-            matrixApi.loginWithToken(
-                MATRIX_HOMESERVER_URL,
-                settings.auth.accessToken,
-                MATRIX_USER_ID,
-            );
-        } else if (settings.auth.method === "password" && settings.auth.password) {
-            const loginResult = await matrixApi.login(
-                MATRIX_HOMESERVER_URL,
-                MATRIX_USER_ID,
-                settings.auth.password,
-            );
-            if (!loginResult) {
-                console.error("[matrix-link-language] login failed");
-            }
-        }
-
-        // Join the room
-        await matrixApi.joinRoom(MATRIX_ROOM_ID);
+        // Network operations are deferred to ensureConnected(), called
+        // lazily on first commit() or sync().
     },
 
     async teardown() {
         myDid = "";
+        connected = false;
+        configured = false;
+        connectingPromise = null;
         matrixApi.clearSession();
         console.log("[matrix-link-language] teardown");
     },
@@ -142,6 +193,16 @@ const language = defineLanguage({
     // -----------------------------------------------------------------------
     commit: {
         async commit(diff: PerspectiveDiff) {
+            // 0. If not configured, store locally only and return
+            if (!configured) {
+                store.applyDiff(diff);
+                emitPerspectiveDiff(diff);
+                return "";
+            }
+
+            // 0b. Ensure we are connected before sending
+            await ensureConnected();
+
             // 1. Store links locally
             store.applyDiff(diff);
 
@@ -215,6 +276,12 @@ const language = defineLanguage({
     // -----------------------------------------------------------------------
     sync: {
         async sync() {
+            if (!configured) {
+                return { additions: [], removals: [] };
+            }
+
+            await ensureConnected();
+
             if (settings.syncMode === "publish-only") {
                 return { additions: [], removals: [] };
             }
@@ -317,6 +384,22 @@ export const {
 } = language;
 
 export default language;
+
+// ---------------------------------------------------------------------------
+// Template params metadata (for language.publish / LanguageMeta)
+// ---------------------------------------------------------------------------
+
+/**
+ * List of template parameters this language expects.  Pass this as
+ * `languageMeta.possibleTemplateParams` when publishing.
+ */
+export const possibleTemplateParams: string[] = [
+    "MATRIX_HOMESERVER_URL",
+    "MATRIX_ROOM_ID",
+    "MATRIX_USER_ID",
+    "MATRIX_ROOM_ALIAS",
+    "NEIGHBOURHOOD_META",
+];
 
 // ---------------------------------------------------------------------------
 // Callback registration
