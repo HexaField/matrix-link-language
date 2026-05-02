@@ -15,7 +15,7 @@
     "rootDir": ".",
     "types": ["node"],
     "paths": {
-      "@coasys/ad4m-ldk": ["..../ad4m/ad4m-ldk/js/lib/index.d.ts"]
+      "@coasys/ad4m-ldk": ["../ad4m/ad4m-ldk/js/lib/index.d.ts"]
     }
   },
   "include": ["index.ts", "src/**/*.ts"],

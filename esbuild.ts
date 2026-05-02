@@ -2,7 +2,7 @@ import * as esbuild from "https://deno.land/x/esbuild@v0.17.18/mod.js";
 import { denoPlugins } from "https://deno.land/x/esbuild_deno_loader@0.7.0/mod.ts";
 import { resolve } from "https://deno.land/std@0.177.0/path/mod.ts";
 
-const ad4mLdkEntry = "../ad4m/ad4m-ldk/js/lib/index.js";
+const ad4mLdkEntry = process.env.AD4M_LDK_ENTRY || "../ad4m/ad4m-ldk/js/lib/index.js";
 
 const projectRoot = new URL(".", import.meta.url).pathname.replace(/\/$/, "");
 
