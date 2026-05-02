@@ -63,6 +63,9 @@ const MATRIX_ROOM_ID = "<to-be-filled>";
 const MATRIX_USER_ID = "<to-be-filled>";
 
 //!@ad4m-template-variable
+const MATRIX_ACCESS_TOKEN = "<to-be-filled>";
+
+//!@ad4m-template-variable
 const MATRIX_ROOM_ALIAS = "<to-be-filled>";
 
 //!@ad4m-template-variable
@@ -103,8 +106,18 @@ async function ensureConnected(): Promise<void> {
 
     connectingPromise = (async () => {
         try {
-            // Authenticate
-            if (settings.auth.method === "access-token" && settings.auth.accessToken) {
+            // Authenticate — try access-token first, then password, then
+            // fall back to a bare session (still sets homeserver URL so
+            // API calls don't break with relative URLs).
+            const hasTemplateToken = !isPlaceholder(MATRIX_ACCESS_TOKEN) && MATRIX_ACCESS_TOKEN;
+            if (hasTemplateToken) {
+                // Token provided via template variable — use it directly
+                matrixApi.loginWithToken(
+                    MATRIX_HOMESERVER_URL,
+                    MATRIX_ACCESS_TOKEN,
+                    MATRIX_USER_ID,
+                );
+            } else if (settings.auth.method === "access-token" && settings.auth.accessToken) {
                 matrixApi.loginWithToken(
                     MATRIX_HOMESERVER_URL,
                     settings.auth.accessToken,
@@ -120,10 +133,26 @@ async function ensureConnected(): Promise<void> {
                     console.error("[matrix-link-language] login failed");
                     return;
                 }
+            } else {
+                // No auth configured — set the session anyway so the
+                // homeserver URL is available for API calls.  The server
+                // will reject authenticated endpoints but at least the
+                // URL construction won't break.
+                console.log("[matrix-link-language] no auth configured, setting bare session");
+                matrixApi.loginWithToken(
+                    MATRIX_HOMESERVER_URL,
+                    "",  // no token
+                    MATRIX_USER_ID || "",
+                );
             }
 
             // Join the room
-            await matrixApi.joinRoom(MATRIX_ROOM_ID);
+            const joinResult = await matrixApi.joinRoom(MATRIX_ROOM_ID);
+            if (!joinResult) {
+                console.error("[matrix-link-language] joinRoom failed (may need auth)");
+                // Still mark connected if we have auth — the join may
+                // have already happened or the room is public
+            }
             connected = true;
             console.log("[matrix-link-language] connected to Matrix");
         } finally {
