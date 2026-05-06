@@ -25,12 +25,12 @@ import type { PerspectiveDiff, LinkExpression } from "./src/types.js";
 import { parseSettings } from "./src/settings.js";
 import type { MatrixSettings } from "./src/settings.js";
 import { diffToEvents, eventsToLinks, linkContentKey } from "./src/translate.js";
-import { shouldFederateLink, linkOriginKey } from "./src/dual-language.js";
-import type { LinkOrigin } from "./src/dual-language.js";
+import { shouldFederateLink, linkOriginKey } from "./src/translate.js";
+import type { LinkOrigin } from "./src/translate.js";
 import * as store from "./src/store.js";
-import * as matrixApi from "./src/matrix-api.js";
-import { generateTxnId } from "./src/matrix-api.pure.js";
-import type { MatrixEvent } from "./src/matrix-api.pure.js";
+import * as matrixApi from "./src/api.js";
+import { generateTxnId } from "./src/api.js";
+import type { MatrixEvent } from "./src/api.js";
 import {
     processSyncResponse,
     processBackfillEvents,
@@ -38,17 +38,11 @@ import {
     setSinceToken,
     extractMembersFromState,
 } from "./src/sync.js";
-import { mxidToDid, didToMxid, parseMemberEvents } from "./src/membership.js";
+import { mxidToDid, didToMxid, parseMemberEvents } from "./src/api.js";
 
 // Adapter imports (interfaces for singletons, Deno impls for init)
-import { initTransport } from "./src/transport.js";
-import { DenoTransport } from "./src/transport-deno.js";
-import { initStorage, getStorage } from "./src/storage-interface.js";
-import { DenoStorageAdapter } from "./src/storage-deno.js";
-import { initSigning } from "./src/signing-interface.js";
-import { DenoSigningAdapter } from "./src/signing-deno.js";
-import { initRuntime } from "./src/runtime-interface.js";
-import { DenoRuntime } from "./src/runtime-deno.js";
+import { initTransport, initStorage, getStorage, initSigning, initRuntime } from "./src/adapters.js";
+import { DenoTransport, DenoStorageAdapter, DenoSigningAdapter, DenoRuntime } from "./src/adapters-deno.js";
 
 // ---------------------------------------------------------------------------
 // Template Variables (per Spec §11)

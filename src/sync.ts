@@ -14,11 +14,11 @@
  */
 
 import type { PerspectiveDiff, LinkExpression } from "./types.js";
-import type { MatrixSyncResponse, MatrixEvent } from "./matrix-api.pure.js";
-import { extractRoomTimeline, extractRoomState, extractPrevBatch } from "./matrix-api.pure.js";
+import type { MatrixSyncResponse, MatrixEvent } from "./api.js";
+import { extractRoomTimeline, extractRoomState, extractPrevBatch } from "./api.js";
 import { eventsToLinks } from "./translate.js";
 import * as store from "./store.js";
-import { getStorage } from "./storage-interface.js";
+import { getStorage } from "./adapters.js";
 
 // ---------------------------------------------------------------------------
 // Since token management

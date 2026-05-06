@@ -5,10 +5,8 @@
 import { describe, it, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 
-import type { StorageAdapter } from "../src/storage-interface.js";
-import { initStorage } from "../src/storage-interface.js";
-import type { RuntimeAdapter } from "../src/runtime-interface.js";
-import { initRuntime } from "../src/runtime-interface.js";
+import type { StorageAdapter, RuntimeAdapter } from "../src/adapters.js";
+import { initStorage, initRuntime } from "../src/adapters.js";
 import * as store from "../src/store.js";
 import type { LinkExpression, PerspectiveDiff } from "../src/types.js";
 

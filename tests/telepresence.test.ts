@@ -9,19 +9,18 @@ import { describe, it, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 
 import {
-    buildGetPresenceUrl,
     buildPresenceUrl,
+    buildPresenceUrl as buildGetPresenceUrl,
     buildSendToDeviceUrl,
     generateTxnId,
-    resetTxnCounter,
-} from "../src/matrix-api.pure.js";
+} from "../src/api.js";
 
-import type { MatrixSyncResponse, MatrixEvent } from "../src/matrix-api.pure.js";
+import type { MatrixSyncResponse, MatrixEvent } from "../src/api.js";
 
-import { mxidToDid, didToMxid, parseMemberEvents } from "../src/membership.js";
+import { mxidToDid, didToMxid, parseMemberEvents } from "../src/api.js";
 
-import { initStorage, getStorage } from "../src/storage-interface.js";
-import type { StorageAdapter } from "../src/storage-interface.js";
+import { initStorage, getStorage } from "../src/adapters.js";
+import type { StorageAdapter } from "../src/adapters.js";
 
 // ---------------------------------------------------------------------------
 // Test helpers — in-memory storage

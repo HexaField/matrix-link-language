@@ -1,11 +1,20 @@
 /**
- * Tests for room membership management.
+ * Tests for Matrix Client-Server API request/response builders and membership.
  */
 
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
 import {
+    buildLoginRequest,
+    buildDefaultFilter,
+    parseLoginResponse,
+    parseSyncResponse,
+    parseMessagesResponse,
+    extractRoomTimeline,
+    extractRoomState,
+    extractPrevBatch,
+    generateTxnId,
     parseMemberEvents,
     mxidToDid,
     didToMxid,
@@ -14,10 +23,207 @@ import {
     canJoin,
     defaultPowerLevels,
     buildPowerLevelOverride,
-} from "../src/membership.js";
+} from "../src/api.js";
 
-import type { RoomMember } from "../src/membership.js";
-import type { MatrixEvent } from "../src/matrix-api.pure.js";
+import type { MatrixSyncResponse, MatrixEvent, RoomMember } from "../src/api.js";
+
+const HOMESERVER = "https://matrix.example.com";
+
+// ---------------------------------------------------------------------------
+// Request Builders
+// ---------------------------------------------------------------------------
+
+describe("buildLoginRequest", () => {
+    it("builds correct URL and body", () => {
+        const { url, body } = buildLoginRequest(HOMESERVER, "bridge", "secret");
+        assert.equal(url, `${HOMESERVER}/_matrix/client/v3/login`);
+        assert.equal(body.type, "m.login.password");
+        assert.equal(body.identifier.type, "m.id.user");
+        assert.equal(body.identifier.user, "bridge");
+        assert.equal(body.password, "secret");
+        assert.equal(body.initial_device_display_name, "AD4M Matrix Bridge");
+    });
+
+    it("includes device_id when provided", () => {
+        const { body } = buildLoginRequest(HOMESERVER, "user", "pass", "MYDEVICE");
+        assert.equal(body.device_id, "MYDEVICE");
+    });
+
+    it("omits device_id when not provided", () => {
+        const { body } = buildLoginRequest(HOMESERVER, "user", "pass");
+        assert.equal(body.device_id, undefined);
+    });
+});
+
+describe("buildDefaultFilter", () => {
+    it("includes expected event types", () => {
+        const filter = buildDefaultFilter();
+        assert.ok(filter.room?.timeline?.types?.includes("dev.ad4m.link.triple"));
+        assert.ok(filter.room?.timeline?.types?.includes("m.room.message"));
+        assert.ok(filter.room?.timeline?.types?.includes("m.reaction"));
+        assert.ok(filter.room?.timeline?.types?.includes("m.room.redaction"));
+        assert.ok(filter.room?.state?.types?.includes("m.room.member"));
+        assert.ok(filter.room?.ephemeral?.types?.includes("m.typing"));
+    });
+});
+
+// ---------------------------------------------------------------------------
+// Response Parsers
+// ---------------------------------------------------------------------------
+
+describe("parseLoginResponse", () => {
+    it("parses valid login response", () => {
+        const raw = JSON.stringify({
+            access_token: "token123",
+            user_id: "@bridge:server",
+            device_id: "DEV1",
+            home_server: "server",
+        });
+        const result = parseLoginResponse(raw);
+        assert.ok(result);
+        assert.equal(result!.access_token, "token123");
+        assert.equal(result!.user_id, "@bridge:server");
+        assert.equal(result!.device_id, "DEV1");
+    });
+
+    it("returns null for missing access_token", () => {
+        assert.equal(parseLoginResponse(JSON.stringify({ user_id: "@a:s" })), null);
+    });
+
+    it("returns null for invalid JSON", () => {
+        assert.equal(parseLoginResponse("not json"), null);
+    });
+});
+
+describe("parseSyncResponse", () => {
+    it("parses valid sync response", () => {
+        const raw = JSON.stringify({
+            next_batch: "s123",
+            rooms: {
+                join: {
+                    "!room:s": {
+                        timeline: { events: [{ type: "m.room.message", content: { body: "hi" } }] },
+                    },
+                },
+            },
+        });
+        const result = parseSyncResponse(raw);
+        assert.ok(result);
+        assert.equal(result!.next_batch, "s123");
+    });
+
+    it("returns null for missing next_batch", () => {
+        assert.equal(parseSyncResponse(JSON.stringify({ rooms: {} })), null);
+    });
+
+    it("returns null for invalid JSON", () => {
+        assert.equal(parseSyncResponse("{bad}"), null);
+    });
+});
+
+describe("parseMessagesResponse", () => {
+    it("parses valid messages response", () => {
+        const raw = JSON.stringify({
+            start: "s1",
+            end: "s2",
+            chunk: [{ type: "m.room.message", content: {} }],
+        });
+        const result = parseMessagesResponse(raw);
+        assert.ok(result);
+        assert.equal(result!.start, "s1");
+        assert.equal(result!.end, "s2");
+        assert.equal(result!.chunk.length, 1);
+    });
+
+    it("returns null for missing chunk array", () => {
+        assert.equal(parseMessagesResponse(JSON.stringify({ start: "s1" })), null);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// Extraction helpers
+// ---------------------------------------------------------------------------
+
+describe("extractRoomTimeline", () => {
+    it("extracts timeline events for a room", () => {
+        const events: MatrixEvent[] = [
+            { type: "m.room.message", content: { body: "hello" } },
+        ];
+        const syncResp: MatrixSyncResponse = {
+            next_batch: "s1",
+            rooms: {
+                join: {
+                    "!room:s": { timeline: { events } },
+                },
+            },
+        };
+        assert.equal(extractRoomTimeline(syncResp, "!room:s").length, 1);
+    });
+
+    it("returns empty array for missing room", () => {
+        const syncResp: MatrixSyncResponse = { next_batch: "s1" };
+        assert.equal(extractRoomTimeline(syncResp, "!missing:s").length, 0);
+    });
+});
+
+describe("extractRoomState", () => {
+    it("extracts state events for a room", () => {
+        const syncResp: MatrixSyncResponse = {
+            next_batch: "s1",
+            rooms: {
+                join: {
+                    "!room:s": {
+                        state: {
+                            events: [{ type: "m.room.name", content: { name: "Test" } }],
+                        },
+                    },
+                },
+            },
+        };
+        assert.equal(extractRoomState(syncResp, "!room:s").length, 1);
+    });
+});
+
+describe("extractPrevBatch", () => {
+    it("extracts prev_batch token", () => {
+        const syncResp: MatrixSyncResponse = {
+            next_batch: "s2",
+            rooms: {
+                join: {
+                    "!room:s": {
+                        timeline: { events: [], prev_batch: "s1" },
+                    },
+                },
+            },
+        };
+        assert.equal(extractPrevBatch(syncResp, "!room:s"), "s1");
+    });
+
+    it("returns null when no prev_batch", () => {
+        const syncResp: MatrixSyncResponse = {
+            next_batch: "s2",
+            rooms: { join: { "!room:s": { timeline: { events: [] } } } },
+        };
+        assert.equal(extractPrevBatch(syncResp, "!room:s"), null);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// Transaction IDs
+// ---------------------------------------------------------------------------
+
+describe("generateTxnId", () => {
+    it("produces unique IDs", () => {
+        const id1 = generateTxnId();
+        const id2 = generateTxnId();
+        assert.notEqual(id1, id2);
+    });
+
+    it("has ad4m prefix", () => {
+        const id = generateTxnId();
+        assert.ok(id.startsWith("ad4m-"));
+    });
+});
 
 // ---------------------------------------------------------------------------
 // parseMemberEvents

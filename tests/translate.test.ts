@@ -1,7 +1,6 @@
 /**
- * Tests for Link ↔ Matrix event translation.
- *
- * Tests the pure translation functions without requiring ad4m:host runtime.
+ * Tests for Link ↔ Matrix event translation, SDNA pattern detection,
+ * rendering, and dual-language deduplication.
  */
 
 import { describe, it } from "node:test";
@@ -19,17 +18,42 @@ import {
     redactionToRemoval,
     inboundEventToLink,
     toISO,
-} from "../src/translate.pure.js";
+    detectPattern,
+    renderLinkAsText,
+    renderLinkAsHtml,
+    renderChatMessageText,
+    renderChatMessageHtml,
+    renderReplyText,
+    renderReplyHtml,
+    renderSemanticHtml,
+    renderBatchHtml,
+    renderReactionText,
+    isDuplicate,
+    linkContentHash,
+    linkOriginKey,
+    shouldFederate,
+    isPredicateExcluded,
+    shouldFederateLink,
+} from "../src/translate.js";
 
-import type { LinkTripleContent, Ad4mMessageContent, ReactionContent } from "../src/translate.pure.js";
+import type { LinkTripleContent, Ad4mMessageContent, ReactionContent, DetectedPattern, LinkOrigin } from "../src/translate.js";
 import type { LinkExpression } from "../src/types.js";
-import type { MatrixEvent } from "../src/matrix-api.pure.js";
+import type { MatrixEvent } from "../src/api.js";
 
 // ---------------------------------------------------------------------------
 // Fixtures
 // ---------------------------------------------------------------------------
 
 const NEIGHBOURHOOD = "neighbourhood://!abc123:matrix.example.com";
+const DEFAULT_CHAT_PREDICATES = ["flux://has_message", "sioc://content_of"];
+
+function simpleHash(data: string): string {
+    let h = 0;
+    for (let i = 0; i < data.length; i++) {
+        h = ((h << 5) - h + data.charCodeAt(i)) | 0;
+    }
+    return `Qm${Math.abs(h).toString(16)}`;
+}
 
 function makeLink(overrides?: Partial<LinkExpression>): LinkExpression {
     return {
@@ -45,6 +69,20 @@ function makeLink(overrides?: Partial<LinkExpression>): LinkExpression {
             key: "key123",
         },
         ...overrides,
+    };
+}
+
+function makeLinkData(overrides?: Partial<LinkExpression["data"]>): LinkExpression {
+    return {
+        author: "did:key:z6MkTest",
+        timestamp: "2026-05-02T00:00:00.000Z",
+        data: {
+            source: "channel://main",
+            target: "expr://msg-001",
+            predicate: "flux://has_message",
+            ...overrides,
+        },
+        proof: { signature: "sig", key: "key" },
     };
 }
 
@@ -442,7 +480,6 @@ describe("Round-trip: link → triple event → link", () => {
         const original = makeLink();
         const tripleContent = linkToTripleContent(original);
 
-        // Simulate event from homeserver
         const event: MatrixEvent = {
             type: "dev.ad4m.link.triple",
             event_id: "$roundtrip:server",
@@ -509,5 +546,482 @@ describe("linkContentKey", () => {
             data: { source: "a", target: "b", predicate: "c" },
         });
         assert.notEqual(linkContentKey(link1), linkContentKey(link2));
+    });
+});
+
+// ===========================================================================
+// SDNA Pattern Detection (from sdna.test.ts)
+// ===========================================================================
+
+describe("detectPattern", () => {
+    describe("chat-message detection", () => {
+        it("detects flux://has_message as chat-message", () => {
+            const result = detectPattern(makeLinkData(), DEFAULT_CHAT_PREDICATES);
+            assert.equal(result.type, "chat-message");
+            assert.equal(result.channelUri, "channel://main");
+            assert.equal(result.contentUri, "expr://msg-001");
+        });
+
+        it("detects sioc://content_of as chat-message (when in chatPredicates)", () => {
+            const link = makeLinkData({ predicate: "sioc://content_of" });
+            const result = detectPattern(link, DEFAULT_CHAT_PREDICATES);
+            assert.equal(result.type, "chat-message");
+        });
+
+        it("detects custom chat predicates", () => {
+            const link = makeLinkData({ predicate: "custom://chat" });
+            const result = detectPattern(link, ["custom://chat"]);
+            assert.equal(result.type, "chat-message");
+        });
+
+        it("does not detect when predicate not in chatPredicates", () => {
+            const link = makeLinkData({ predicate: "flux://has_message" });
+            const result = detectPattern(link, []);
+            assert.equal(result.type, "unknown");
+        });
+    });
+
+    describe("reply detection", () => {
+        it("detects flux://has_reply", () => {
+            const link = makeLinkData({
+                source: "expr://parent",
+                target: "expr://reply",
+                predicate: "flux://has_reply",
+            });
+            const result = detectPattern(link, DEFAULT_CHAT_PREDICATES);
+            assert.equal(result.type, "reply");
+            assert.equal(result.parentUri, "expr://parent");
+            assert.equal(result.contentUri, "expr://reply");
+        });
+
+        it("detects sioc://reply_of", () => {
+            const link = makeLinkData({ predicate: "sioc://reply_of" });
+            const result = detectPattern(link, DEFAULT_CHAT_PREDICATES);
+            assert.equal(result.type, "reply");
+        });
+    });
+
+    describe("mention detection", () => {
+        it("detects predicate containing 'mention'", () => {
+            const link = makeLinkData({
+                target: "did:key:z6MkAlice",
+                predicate: "flux://has_mention",
+            });
+            const result = detectPattern(link, DEFAULT_CHAT_PREDICATES);
+            assert.equal(result.type, "mention");
+            assert.equal(result.mentionedAgent, "did:key:z6MkAlice");
+        });
+
+        it("detects case-insensitively", () => {
+            const link = makeLinkData({ predicate: "custom://HasMention" });
+            const result = detectPattern(link, DEFAULT_CHAT_PREDICATES);
+            assert.equal(result.type, "mention");
+        });
+
+        it("detects partial 'mention' in predicate", () => {
+            const link = makeLinkData({ predicate: "app://user_mentioned" });
+            const result = detectPattern(link, DEFAULT_CHAT_PREDICATES);
+            assert.equal(result.type, "mention");
+        });
+    });
+
+    describe("reaction detection", () => {
+        it("detects flux://has_reaction", () => {
+            const link = makeLinkData({
+                source: "expr://msg",
+                target: "👍",
+                predicate: "flux://has_reaction",
+            });
+            const result = detectPattern(link, DEFAULT_CHAT_PREDICATES);
+            assert.equal(result.type, "reaction");
+            assert.equal(result.contentUri, "👍");
+        });
+
+        it("detects emoji://reaction", () => {
+            const link = makeLinkData({ target: "❤️", predicate: "emoji://reaction" });
+            const result = detectPattern(link, DEFAULT_CHAT_PREDICATES);
+            assert.equal(result.type, "reaction");
+        });
+    });
+
+    describe("content detection", () => {
+        it("detects sioc://content_of when NOT in chatPredicates", () => {
+            const link = makeLinkData({ predicate: "sioc://content_of" });
+            const result = detectPattern(link, ["flux://has_message"]);
+            assert.equal(result.type, "content");
+        });
+    });
+
+    describe("priority ordering", () => {
+        it("chat predicate takes priority over content_of", () => {
+            const link = makeLinkData({ predicate: "sioc://content_of" });
+            const result = detectPattern(link, DEFAULT_CHAT_PREDICATES);
+            assert.equal(result.type, "chat-message");
+        });
+
+        it("reply is detected when not a chat predicate", () => {
+            const link = makeLinkData({ predicate: "flux://has_reply" });
+            const result = detectPattern(link, DEFAULT_CHAT_PREDICATES);
+            assert.equal(result.type, "reply");
+        });
+    });
+
+    describe("edge cases", () => {
+        it("returns unknown for empty predicate", () => {
+            const link = makeLinkData({ predicate: "" });
+            assert.equal(detectPattern(link, DEFAULT_CHAT_PREDICATES).type, "unknown");
+        });
+
+        it("returns unknown for undefined predicate", () => {
+            const link = makeLinkData({ predicate: undefined });
+            assert.equal(detectPattern(link, DEFAULT_CHAT_PREDICATES).type, "unknown");
+        });
+
+        it("returns unknown for unrecognized predicate", () => {
+            const link = makeLinkData({ predicate: "custom://unknown-action" });
+            assert.equal(detectPattern(link, DEFAULT_CHAT_PREDICATES).type, "unknown");
+        });
+
+        it("handles empty chatPredicates array", () => {
+            const link = makeLinkData({ predicate: "flux://has_message" });
+            assert.equal(detectPattern(link, []).type, "unknown");
+        });
+
+        it("handles link with empty source and target", () => {
+            const link = makeLinkData({ source: "", target: "" });
+            const result = detectPattern(link, DEFAULT_CHAT_PREDICATES);
+            assert.equal(result.type, "chat-message");
+            assert.equal(result.channelUri, "");
+            assert.equal(result.contentUri, "");
+        });
+    });
+});
+
+// ===========================================================================
+// Rendering (from rendering.test.ts)
+// ===========================================================================
+
+describe("renderLinkAsText", () => {
+    it("renders a full triple", () => {
+        const link = makeLinkData();
+        const text = renderLinkAsText(link);
+        assert.equal(text, "channel://main —[flux://has_message]→ expr://msg-001");
+    });
+
+    it("renders target only when source and predicate are empty", () => {
+        const link = makeLinkData({ source: "", predicate: "" });
+        const text = renderLinkAsText(link);
+        assert.equal(text, "expr://msg-001");
+    });
+
+    it("renders [empty link] when all fields empty", () => {
+        const link = makeLinkData({ source: "", predicate: "", target: "" });
+        assert.equal(renderLinkAsText(link), "[empty link]");
+    });
+});
+
+describe("renderChatMessageText", () => {
+    it("uses resolved content when available", () => {
+        const link = makeLinkData();
+        assert.equal(renderChatMessageText(link, "Hello!"), "Hello!");
+    });
+
+    it("falls back to target URI", () => {
+        const link = makeLinkData();
+        assert.equal(renderChatMessageText(link), "expr://msg-001");
+    });
+
+    it("returns [no content] when target is empty", () => {
+        const link = makeLinkData({ target: "" });
+        assert.equal(renderChatMessageText(link), "[no content]");
+    });
+});
+
+describe("renderReplyText", () => {
+    it("includes parent author in quote", () => {
+        const link = makeLinkData();
+        const text = renderReplyText(link, "I agree!", "Alice");
+        assert.equal(text, "> Alice:\nI agree!");
+    });
+
+    it("omits quote without parent author", () => {
+        const link = makeLinkData();
+        assert.equal(renderReplyText(link, "Reply"), "Reply");
+    });
+
+    it("falls back to target URI without resolved content", () => {
+        const link = makeLinkData();
+        assert.equal(renderReplyText(link), "expr://msg-001");
+    });
+});
+
+describe("renderReactionText", () => {
+    it("returns the emoji", () => {
+        assert.equal(renderReactionText("👍"), "👍");
+    });
+
+    it("defaults to 👍", () => {
+        assert.equal(renderReactionText(""), "👍");
+    });
+});
+
+describe("renderLinkAsHtml", () => {
+    it("renders triple with code tags", () => {
+        const link = makeLinkData();
+        const html = renderLinkAsHtml(link);
+        assert.ok(html.includes("🔗"));
+        assert.ok(html.includes("<code>channel://main</code>"));
+        assert.ok(html.includes("<code>flux://has_message</code>"));
+        assert.ok(html.includes("<code>expr://msg-001</code>"));
+    });
+
+    it("escapes HTML entities", () => {
+        const link = makeLinkData({ source: "<script>alert(1)</script>" });
+        const html = renderLinkAsHtml(link);
+        assert.ok(html.includes("&lt;script&gt;"));
+        assert.ok(!html.includes("<script>"));
+    });
+
+    it("handles empty source and predicate", () => {
+        const link = makeLinkData({ source: "", predicate: "" });
+        const html = renderLinkAsHtml(link);
+        assert.ok(html.includes("expr://msg-001"));
+    });
+});
+
+describe("renderChatMessageHtml", () => {
+    it("wraps resolved content in paragraph", () => {
+        const link = makeLinkData();
+        assert.equal(renderChatMessageHtml(link, "Hello!"), "<p>Hello!</p>");
+    });
+
+    it("escapes HTML in resolved content", () => {
+        const link = makeLinkData();
+        const html = renderChatMessageHtml(link, "<b>bold</b>");
+        assert.ok(html.includes("&lt;b&gt;bold&lt;/b&gt;"));
+    });
+
+    it("falls back to target URI", () => {
+        const link = makeLinkData();
+        assert.equal(renderChatMessageHtml(link), "<p>expr://msg-001</p>");
+    });
+});
+
+describe("renderReplyHtml", () => {
+    it("includes blockquote for parent author", () => {
+        const link = makeLinkData();
+        const html = renderReplyHtml(link, "I agree!", "Alice");
+        assert.ok(html.includes("<blockquote>"));
+        assert.ok(html.includes("Alice"));
+        assert.ok(html.includes("I agree!"));
+    });
+
+    it("omits blockquote without parent author", () => {
+        const link = makeLinkData();
+        const html = renderReplyHtml(link, "Reply");
+        assert.ok(!html.includes("<blockquote>"));
+        assert.ok(html.includes("Reply"));
+    });
+});
+
+describe("renderSemanticHtml", () => {
+    it("renders with author and full triple", () => {
+        const link = makeLinkData();
+        const html = renderSemanticHtml(link);
+        assert.ok(html.includes("<strong>did:key:z6MkTest</strong>"));
+        assert.ok(html.includes("channel://main"));
+        assert.ok(html.includes("flux://has_message"));
+        assert.ok(html.includes("expr://msg-001"));
+    });
+});
+
+describe("renderBatchHtml", () => {
+    it("renders empty batch", () => {
+        assert.equal(renderBatchHtml([]), "<p>No links</p>");
+    });
+
+    it("renders single link (delegates to renderLinkAsHtml)", () => {
+        const link = makeLinkData();
+        const html = renderBatchHtml([link]);
+        assert.ok(html.includes("🔗"));
+    });
+
+    it("renders multiple links as list", () => {
+        const links = [
+            makeLinkData(),
+            makeLinkData({ source: "a", target: "b", predicate: "c" }),
+        ];
+        const html = renderBatchHtml(links);
+        assert.ok(html.includes("📦 2 links:"));
+        assert.ok(html.includes("<ul>"));
+        assert.ok(html.includes("<li>"));
+    });
+});
+
+// ===========================================================================
+// Dual-Language Dedup (from dual-language.test.ts)
+// ===========================================================================
+
+describe("isDuplicate", () => {
+    it("returns false when no existing hashes", () => {
+        const link = makeLinkData({ source: "literal://hello", target: "literal://world", predicate: "sioc://content_of" });
+        const existing = new Set<string>();
+        assert.equal(isDuplicate(link, existing, simpleHash), false);
+    });
+
+    it("returns true when content hash matches existing", () => {
+        const link = makeLinkData({ source: "literal://hello", target: "literal://world", predicate: "sioc://content_of" });
+        const contentHash = linkContentHash(link, simpleHash);
+        const existing = new Set<string>([contentHash]);
+        assert.equal(isDuplicate(link, existing, simpleHash), true);
+    });
+
+    it("returns false for different link content", () => {
+        const link1 = makeLinkData({ source: "a", target: "b", predicate: "c" });
+        const link2 = makeLinkData({ source: "x", target: "y", predicate: "z" });
+        const hash1 = linkContentHash(link1, simpleHash);
+        const existing = new Set<string>([hash1]);
+        assert.equal(isDuplicate(link2, existing, simpleHash), false);
+    });
+
+    it("deduplicates based on triple only (ignores author/timestamp)", () => {
+        const link1 = makeLinkData({ source: "literal://hello", target: "literal://world", predicate: "sioc://content_of" });
+        const link2: LinkExpression = {
+            ...makeLinkData({ source: "literal://hello", target: "literal://world", predicate: "sioc://content_of" }),
+            author: "did:key:z6MkOther",
+            timestamp: "2026-06-01T00:00:00.000Z",
+        };
+        const hash1 = linkContentHash(link1, simpleHash);
+        const existing = new Set<string>([hash1]);
+        assert.equal(isDuplicate(link2, existing, simpleHash), true);
+    });
+});
+
+describe("linkContentHash", () => {
+    it("produces deterministic hash", () => {
+        const link = makeLinkData({ source: "literal://hello", target: "literal://world", predicate: "sioc://content_of" });
+        assert.equal(linkContentHash(link, simpleHash), linkContentHash(link, simpleHash));
+    });
+
+    it("produces different hashes for different links", () => {
+        const link1 = makeLinkData({ source: "a" });
+        const link2 = makeLinkData({ source: "b" });
+        assert.notEqual(linkContentHash(link1, simpleHash), linkContentHash(link2, simpleHash));
+    });
+
+    it("ignores author and timestamp in hash", () => {
+        const link1 = makeLinkData({ source: "literal://hello", target: "literal://world", predicate: "sioc://content_of" });
+        const link2: LinkExpression = {
+            ...makeLinkData({ source: "literal://hello", target: "literal://world", predicate: "sioc://content_of" }),
+            author: "did:key:z6MkDifferent",
+            timestamp: "2099-01-01T00:00:00.000Z",
+        };
+        assert.equal(linkContentHash(link1, simpleHash), linkContentHash(link2, simpleHash));
+    });
+});
+
+describe("linkOriginKey", () => {
+    it("produces correct storage key format", () => {
+        assert.equal(linkOriginKey("abc123"), "link-origin/abc123");
+    });
+
+    it("handles empty hash", () => {
+        assert.equal(linkOriginKey(""), "link-origin/");
+    });
+});
+
+describe("shouldFederate", () => {
+    it("returns true when no origin is tracked (new local commit)", () => {
+        assert.equal(shouldFederate("hash123", () => null), true);
+    });
+
+    it("returns true for native-origin links", () => {
+        const getOrigin = (key: string): string | null => {
+            if (key === "link-origin/hash123") return "native";
+            return null;
+        };
+        assert.equal(shouldFederate("hash123", getOrigin), true);
+    });
+
+    it("returns true for dual-origin links", () => {
+        const getOrigin = (key: string): string | null => {
+            if (key === "link-origin/hash456") return "dual";
+            return null;
+        };
+        assert.equal(shouldFederate("hash456", getOrigin), true);
+    });
+
+    it("returns false for matrix-origin links (prevents echo loop)", () => {
+        const getOrigin = (key: string): string | null => {
+            if (key === "link-origin/hash789") return "matrix";
+            return null;
+        };
+        assert.equal(shouldFederate("hash789", getOrigin), false);
+    });
+
+    it("constructs correct storage key for lookup", () => {
+        let queriedKey = "";
+        const getOrigin = (key: string): string | null => {
+            queriedKey = key;
+            return null;
+        };
+        shouldFederate("myLinkHash", getOrigin);
+        assert.equal(queriedKey, "link-origin/myLinkHash");
+    });
+});
+
+describe("isPredicateExcluded", () => {
+    it("returns false for empty exclude list", () => {
+        assert.equal(isPredicateExcluded("flux://has_message", []), false);
+    });
+
+    it("returns true for excluded predicate", () => {
+        assert.equal(isPredicateExcluded("flux://internal", ["flux://internal"]), true);
+    });
+
+    it("returns false for non-excluded predicate", () => {
+        assert.equal(isPredicateExcluded("flux://public", ["flux://internal"]), false);
+    });
+
+    it("returns false for undefined predicate", () => {
+        assert.equal(isPredicateExcluded(undefined, ["flux://internal"]), false);
+    });
+});
+
+describe("shouldFederateLink", () => {
+    it("returns false when predicate is excluded", () => {
+        assert.equal(
+            shouldFederateLink("hash", "flux://internal", () => null, ["flux://internal"]),
+            false,
+        );
+    });
+
+    it("returns false when origin is matrix", () => {
+        const getOrigin = (key: string): string | null => {
+            if (key === "link-origin/hash") return "matrix";
+            return null;
+        };
+        assert.equal(
+            shouldFederateLink("hash", "flux://public", getOrigin, []),
+            false,
+        );
+    });
+
+    it("returns true when all checks pass", () => {
+        assert.equal(
+            shouldFederateLink("hash", "flux://public", () => null, []),
+            true,
+        );
+    });
+
+    it("returns true for native origin with non-excluded predicate", () => {
+        const getOrigin = (key: string): string | null => {
+            if (key === "link-origin/hash") return "native";
+            return null;
+        };
+        assert.equal(
+            shouldFederateLink("hash", "flux://public", getOrigin, ["flux://internal"]),
+            true,
+        );
     });
 });

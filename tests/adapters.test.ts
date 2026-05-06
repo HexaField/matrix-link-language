@@ -4,42 +4,25 @@
  * Exercises the full production modules using mock adapters that
  * simulate an alternative runtime. Proves that the core logic has
  * NO hidden dependency on ad4m:host.
- *
- * Test scenarios:
- * 1. Store links via mock storage, query them back, verify indexes
- * 2. Process sync responses with mock storage
- * 3. Translate links to Matrix events and back (round-trip)
- * 4. Full pipeline: link → event → back → verify
- * 5. Settings parsing
- * 6. Dual-language federation filter
  */
 
 import { describe, it, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 
 // Adapter interfaces
-import type { StorageAdapter } from "../src/storage-interface.js";
-import { initStorage } from "../src/storage-interface.js";
-import type { Transport, TransportResponse } from "../src/transport.js";
-import { initTransport } from "../src/transport.js";
-import type { SigningAdapter } from "../src/signing-interface.js";
-import { initSigning } from "../src/signing-interface.js";
-import type { RuntimeAdapter } from "../src/runtime-interface.js";
-import { initRuntime } from "../src/runtime-interface.js";
+import type { StorageAdapter, Transport, TransportResponse, SigningAdapter, RuntimeAdapter } from "../src/adapters.js";
+import { initStorage, initTransport, initSigning, initRuntime } from "../src/adapters.js";
 
 // Production modules under test
 import * as store from "../src/store.js";
-import { diffToEvents, eventsToLinks, linkToTripleContent, linkContentKey } from "../src/translate.js";
+import { diffToEvents, eventsToLinks, linkToTripleContent, linkContentKey, detectPattern, renderLinkAsText, renderLinkAsHtml, shouldFederate, linkOriginKey } from "../src/translate.js";
 import { processSyncResponse, getSinceToken } from "../src/sync.js";
-import { shouldFederate, linkOriginKey } from "../src/dual-language.js";
 import { parseSettings, DEFAULT_SETTINGS } from "../src/settings.js";
-import { parseMemberEvents, mxidToDid } from "../src/membership.js";
-import { detectPattern } from "../src/sdna.js";
-import { renderLinkAsText, renderLinkAsHtml } from "../src/rendering.pure.js";
+import { parseMemberEvents, mxidToDid } from "../src/api.js";
 
 // Types
 import type { LinkExpression, PerspectiveDiff } from "../src/types.js";
-import type { MatrixSyncResponse, MatrixEvent } from "../src/matrix-api.pure.js";
+import type { MatrixSyncResponse, MatrixEvent } from "../src/api.js";
 
 // ---------------------------------------------------------------------------
 // Mock Adapters

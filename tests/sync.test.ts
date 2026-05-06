@@ -5,10 +5,8 @@
 import { describe, it, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 
-import type { StorageAdapter } from "../src/storage-interface.js";
-import { initStorage } from "../src/storage-interface.js";
-import type { RuntimeAdapter } from "../src/runtime-interface.js";
-import { initRuntime } from "../src/runtime-interface.js";
+import type { StorageAdapter, RuntimeAdapter } from "../src/adapters.js";
+import { initStorage, initRuntime } from "../src/adapters.js";
 import * as store from "../src/store.js";
 import {
     getSinceToken,
@@ -21,7 +19,7 @@ import {
     processBackfillEvents,
     extractMembersFromState,
 } from "../src/sync.js";
-import type { MatrixSyncResponse, MatrixEvent } from "../src/matrix-api.pure.js";
+import type { MatrixSyncResponse, MatrixEvent } from "../src/api.js";
 
 // ---------------------------------------------------------------------------
 // Mock Adapters
