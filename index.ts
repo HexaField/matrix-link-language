@@ -5,9 +5,10 @@
  * Implements perspective-commit, perspective-sync, perspective-query,
  * and peers capabilities.
  *
- * Publishes links as Matrix room events (dev.ad4m.link.triple + m.room.message),
- * processes inbound events via /sync long-poll, handles room membership,
- * and manages bidirectional link federation.
+ * Now with full Flux ↔ Matrix interop:
+ * - Flux Messages (flux://body links) are sent as m.room.message to Matrix
+ * - Matrix m.room.message events are converted to Flux Message link sets
+ *   (ad4m://has_child + flux://entry_type + flux://body)
  *
  * Spec: matrix-link-language.md
  */
@@ -67,6 +68,23 @@ const MATRIX_ROOM_ALIAS = "<to-be-filled>";
 const NEIGHBOURHOOD_META = "<to-be-filled>";
 
 // ---------------------------------------------------------------------------
+// Flux Constants (matching @coasys/flux-constants)
+// ---------------------------------------------------------------------------
+
+const FLUX = {
+    ENTRY_TYPE: "flux://entry_type",
+    HAS_COMMUNITY: "flux://has_community",
+    HAS_CHANNEL: "flux://has_channel",
+    HAS_MESSAGE: "flux://has_message",
+    BODY: "flux://body",
+    CHANNEL_NAME: "flux://has_channel_name",
+    HAS_CHILD: "ad4m://has_child",
+    TIMESTAMP: "ad4m://ontology/timestamp",
+    AUTHOR: "ad4m://ontology/author",
+    NAME: "rdf://name",
+};
+
+// ---------------------------------------------------------------------------
 // Module state
 // ---------------------------------------------------------------------------
 
@@ -78,6 +96,9 @@ let configured: boolean = false;
 let connected: boolean = false;
 /** Guard to prevent concurrent ensureConnected() calls. */
 let connectingPromise: Promise<void> | null = null;
+
+/** Known channel IDs in this perspective (tracked for message routing). */
+let knownChannelIds: Set<string> = new Set();
 
 /** Registered telepresence signal callback. */
 let telepresenceSignalCallback: ((payload: unknown) => void) | null = null;
@@ -104,12 +125,8 @@ async function ensureConnected(): Promise<void> {
 
     connectingPromise = (async () => {
         try {
-            // Authenticate — try access-token first, then password, then
-            // fall back to a bare session (still sets homeserver URL so
-            // API calls don't break with relative URLs).
             const hasTemplateToken = !isPlaceholder(MATRIX_ACCESS_TOKEN) && MATRIX_ACCESS_TOKEN;
             if (hasTemplateToken) {
-                // Token provided via template variable — use it directly
                 matrixApi.loginWithToken(
                     MATRIX_HOMESERVER_URL,
                     MATRIX_ACCESS_TOKEN,
@@ -132,14 +149,10 @@ async function ensureConnected(): Promise<void> {
                     return;
                 }
             } else {
-                // No auth configured — set the session anyway so the
-                // homeserver URL is available for API calls.  The server
-                // will reject authenticated endpoints but at least the
-                // URL construction won't break.
                 console.log("[matrix-link-language] no auth configured, setting bare session");
                 matrixApi.loginWithToken(
                     MATRIX_HOMESERVER_URL,
-                    "",  // no token
+                    "",
                     MATRIX_USER_ID || "",
                 );
             }
@@ -148,8 +161,6 @@ async function ensureConnected(): Promise<void> {
             const joinResult = await matrixApi.joinRoom(MATRIX_ROOM_ID);
             if (!joinResult) {
                 console.error("[matrix-link-language] joinRoom failed (may need auth)");
-                // Still mark connected if we have auth — the join may
-                // have already happened or the room is public
             }
             connected = true;
             console.log("[matrix-link-language] connected to Matrix");
@@ -162,47 +173,187 @@ async function ensureConnected(): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// Flux Message Detection & Extraction
+// ---------------------------------------------------------------------------
+
+/**
+ * Extract the text body from a literal URI (literal://string:...).
+ */
+function extractLiteralString(uri: string): string | null {
+    if (uri.startsWith("literal://string:")) {
+        return decodeURIComponent(uri.slice("literal://string:".length));
+    }
+    // Handle JSON-encoded literals
+    if (uri.startsWith("literal://json:")) {
+        try {
+            return JSON.parse(decodeURIComponent(uri.slice("literal://json:".length)));
+        } catch { return null; }
+    }
+    return null;
+}
+
+/**
+ * Encode a string as a literal URI.
+ */
+function toLiteralString(text: string): string {
+    return `literal://string:${encodeURIComponent(text)}`;
+}
+
+/**
+ * Detect if a batch of additions contains a Flux message creation.
+ * Returns the body text and metadata if found.
+ *
+ * A Flux message consists of multiple links added together:
+ * 1. channelId --ad4m://has_child--> messageId (reified with author+timestamp)
+ * 2. messageId --flux://entry_type--> flux://has_message
+ * 3. messageId --flux://body--> literal://string:{body}
+ */
+interface FluxMessageInfo {
+    messageId: string;
+    channelId: string;
+    body: string;
+    author: string;
+    timestamp: string;
+}
+
+function detectFluxMessages(additions: LinkExpression[]): FluxMessageInfo[] {
+    const messages: FluxMessageInfo[] = [];
+
+    // Find all flux://body links — these indicate a message body
+    const bodyLinks = additions.filter(l =>
+        l.data.predicate === FLUX.BODY
+    );
+
+    for (const bodyLink of bodyLinks) {
+        const messageId = bodyLink.data.source;
+        const bodyText = extractLiteralString(bodyLink.data.target);
+        if (!messageId || !bodyText) continue;
+
+        // Find the type flag confirming this is a message
+        const typeLink = additions.find(l =>
+            l.data.source === messageId &&
+            l.data.predicate === FLUX.ENTRY_TYPE &&
+            l.data.target === FLUX.HAS_MESSAGE
+        );
+        if (!typeLink) continue;
+
+        // Find the has_child link to get the channel and metadata
+        const childLink = additions.find(l =>
+            l.data.target === messageId &&
+            l.data.predicate === FLUX.HAS_CHILD
+        );
+
+        const channelId = childLink?.data.source || "";
+        const author = bodyLink.author || childLink?.author || myDid;
+        const timestamp = bodyLink.timestamp || childLink?.timestamp || new Date().toISOString();
+
+        messages.push({
+            messageId,
+            channelId,
+            body: bodyText,
+            author,
+            timestamp,
+        });
+    }
+
+    return messages;
+}
+
+/**
+ * Convert a Matrix m.room.message into a set of Flux Message links.
+ */
+function matrixMessageToFluxLinks(
+    event: MatrixEvent,
+    channelId: string,
+): LinkExpression[] {
+    const content = event.content as Record<string, unknown>;
+    if (!content || content.msgtype !== "m.text") return [];
+
+    const body = content.body as string;
+    if (!body) return [];
+
+    // Skip messages that originated from AD4M (echo suppression)
+    const ad4m = content.ad4m as Record<string, unknown> | undefined;
+    if (ad4m) return [];
+
+    const timestamp = event.origin_server_ts
+        ? new Date(event.origin_server_ts).toISOString()
+        : new Date().toISOString();
+
+    const author = event.sender
+        ? mxidToDid(event.sender)
+        : "matrix:unknown";
+
+    // Generate a stable message ID from the Matrix event ID
+    const messageId = `matrix-msg://${event.event_id || Date.now()}`;
+
+    const links: LinkExpression[] = [];
+
+    // 1. Channel → Message (has_child) — the core parent-child relationship
+    links.push({
+        author,
+        timestamp,
+        data: {
+            source: channelId,
+            target: messageId,
+            predicate: FLUX.HAS_CHILD,
+        },
+        proof: { signature: "", key: "" },
+    });
+
+    // 2. Message type flag
+    links.push({
+        author,
+        timestamp,
+        data: {
+            source: messageId,
+            target: FLUX.HAS_MESSAGE,
+            predicate: FLUX.ENTRY_TYPE,
+        },
+        proof: { signature: "", key: "" },
+    });
+
+    // 3. Message body
+    links.push({
+        author,
+        timestamp,
+        data: {
+            source: messageId,
+            target: toLiteralString(body),
+            predicate: FLUX.BODY,
+        },
+        proof: { signature: "", key: "" },
+    });
+
+    return links;
+}
+
+// ---------------------------------------------------------------------------
 // DID ↔ MXID Mapping (for telepresence)
 // ---------------------------------------------------------------------------
 
 const DID_TO_MXID_PREFIX = "did-mxid/";
 const MXID_TO_DID_PREFIX = "mxid-did/";
 
-/**
- * Store a DID ↔ MXID mapping in both directions.
- */
 function storeDIDMapping(did: string, mxid: string): void {
     const storage = getStorage();
     storage.put(`${DID_TO_MXID_PREFIX}${did}`, mxid);
     storage.put(`${MXID_TO_DID_PREFIX}${mxid}`, did);
 }
 
-/**
- * Look up MXID by DID.
- */
 function getMxidForDid(did: string): string | null {
     return getStorage().get(`${DID_TO_MXID_PREFIX}${did}`);
 }
 
-/**
- * Look up DID by MXID.
- */
 function getDidForMxid(mxid: string): string | null {
     return getStorage().get(`${MXID_TO_DID_PREFIX}${mxid}`);
 }
 
-/**
- * Extract the homeserver name from a Matrix user ID.
- * e.g. "@user:matrix.org" → "matrix.org"
- */
 function extractServerName(userId: string): string {
     const match = userId.match(/:(.+)$/);
     return match ? match[1] : "";
 }
 
-/**
- * Map an AD4M online status to a Matrix presence state.
- */
 function mapStatusToPresence(status: unknown): "online" | "offline" | "unavailable" {
     if (typeof status === "string") {
         switch (status.toLowerCase()) {
@@ -224,35 +375,55 @@ function mapStatusToPresence(status: unknown): "online" | "offline" | "unavailab
     return "online";
 }
 
-/**
- * Process to-device events from a sync response, invoking the
- * telepresence signal callback for matching event types.
- */
 function processToDeviceEvents(events: MatrixEvent[]): void {
     if (!telepresenceSignalCallback) return;
-
     for (const event of events) {
         if (event.type === "dev.ad4m.signal" || event.type === "dev.ad4m.broadcast") {
-            const payload = event.content;
-            telepresenceSignalCallback(payload);
+            telepresenceSignalCallback(event.content);
+        }
+    }
+}
+
+function processTimelineBroadcasts(events: MatrixEvent[], myUserId: string): void {
+    if (!telepresenceSignalCallback) return;
+    for (const event of events) {
+        if (event.type === "dev.ad4m.broadcast") {
+            if (event.sender === myUserId) continue;
+            telepresenceSignalCallback(event.content);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Channel tracking
+// ---------------------------------------------------------------------------
+
+/**
+ * Scan links for channel definitions and track their IDs.
+ */
+function trackChannels(links: LinkExpression[]): void {
+    for (const link of links) {
+        // Detect channel type flags
+        if (link.data.predicate === FLUX.ENTRY_TYPE &&
+            link.data.target === FLUX.HAS_CHANNEL) {
+            knownChannelIds.add(link.data.source);
+        }
+        // Detect has_channel relations (community → channel)
+        if (link.data.predicate === FLUX.HAS_CHANNEL) {
+            knownChannelIds.add(link.data.target);
         }
     }
 }
 
 /**
- * Process timeline events from a sync response for broadcast signals.
- * Invokes the telepresence signal callback for dev.ad4m.broadcast room events.
+ * Get the first known channel ID (for routing inbound messages).
  */
-function processTimelineBroadcasts(events: MatrixEvent[], myUserId: string): void {
-    if (!telepresenceSignalCallback) return;
-
-    for (const event of events) {
-        if (event.type === "dev.ad4m.broadcast") {
-            // Skip our own broadcasts
-            if (event.sender === myUserId) continue;
-            telepresenceSignalCallback(event.content);
-        }
+function getDefaultChannelId(): string {
+    if (knownChannelIds.size > 0) {
+        return knownChannelIds.values().next().value!;
     }
+    // Fall back to a synthetic channel reference
+    return `channel://${MATRIX_ROOM_ID}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -261,7 +432,7 @@ function processTimelineBroadcasts(events: MatrixEvent[], myUserId: string): voi
 
 const language = defineLanguage({
     name: "@hexafield/matrix-link-language",
-    version: "0.1.0",
+    version: "0.2.0",
 
     isPublic: true,
 
@@ -290,10 +461,10 @@ const language = defineLanguage({
         console.log(`[matrix-link-language] room: ${MATRIX_ROOM_ID}`);
         console.log(`[matrix-link-language] configured: ${configured}`);
         console.log(`[matrix-link-language] sync mode: ${settings.syncMode}`);
-        console.log(`[matrix-link-language] rendering: ${settings.rendering.strategy}`);
 
-        // Network operations are deferred to ensureConnected(), called
-        // lazily on first commit() or sync().
+        // Scan existing links for channel IDs
+        const allLinks = store.allLinks();
+        trackChannels(allLinks.links);
     },
 
     async teardown() {
@@ -302,6 +473,7 @@ const language = defineLanguage({
         configured = false;
         connectingPromise = null;
         telepresenceSignalCallback = null;
+        knownChannelIds.clear();
         matrixApi.clearSession();
         console.log("[matrix-link-language] teardown");
     },
@@ -318,6 +490,7 @@ const language = defineLanguage({
             // 0. If not configured, store locally only and return
             if (!configured) {
                 store.applyDiff(diff);
+                trackChannels(diff.additions);
                 emitPerspectiveDiff(diff);
                 return "";
             }
@@ -327,6 +500,7 @@ const language = defineLanguage({
 
             // 1. Store links locally
             store.applyDiff(diff);
+            trackChannels(diff.additions);
 
             // 1b. Store DID ↔ MXID mapping for our commits
             if (myDid && MATRIX_USER_ID) {
@@ -339,7 +513,43 @@ const language = defineLanguage({
                 return "";
             }
 
-            // 3. Track origins for new native commits
+            // ------------------------------------------------------------------
+            // FLUX MESSAGE DETECTION
+            // Detect Flux message patterns and send as m.room.message
+            // ------------------------------------------------------------------
+            const fluxMessages = detectFluxMessages(diff.additions);
+            const sentMessageIds = new Set<string>();
+
+            for (const msg of fluxMessages) {
+                // Send to Matrix as a readable m.room.message
+                const txnId = generateTxnId();
+                const messageContent: Record<string, unknown> = {
+                    msgtype: "m.text",
+                    body: msg.body,
+                    // Tag with ad4m metadata so we can suppress echo on sync
+                    ad4m: {
+                        source: msg.channelId,
+                        predicate: FLUX.HAS_CHILD,
+                        target: msg.messageId,
+                        author: msg.author,
+                        message_id: msg.messageId,
+                    },
+                };
+                await matrixApi.sendEvent(
+                    MATRIX_ROOM_ID,
+                    "m.room.message",
+                    messageContent,
+                    txnId,
+                );
+                sentMessageIds.add(msg.messageId);
+                console.log(`[matrix-link-language] sent Flux message to Matrix: "${msg.body.substring(0, 50)}..."`);
+            }
+
+            // ------------------------------------------------------------------
+            // STANDARD LINK FEDERATION (for non-message links)
+            // ------------------------------------------------------------------
+
+            // Track origins for new native commits
             for (const link of diff.additions) {
                 const h = store.hashLink(link);
                 const originKey = linkOriginKey(h);
@@ -351,26 +561,39 @@ const language = defineLanguage({
                 }
             }
 
-            // 4. Build federation filter
+            // Build federation filter
             const federationFilter = (linkHash: string): boolean => {
                 if (!settings.dualLanguage.enabled) return true;
                 return shouldFederateLink(
                     linkHash,
-                    undefined, // predicate checked in diffToEvents
+                    undefined,
                     (key) => getStorage().get(key),
                     settings.dualLanguage.excludePredicates,
                 );
             };
 
-            // 5. Translate to Matrix events
-            const events = diffToEvents(diff, {
+            // Filter out links that are part of already-sent Flux messages
+            const nonMessageAdditions = diff.additions.filter(link => {
+                // If this link is part of a Flux message we already sent, skip
+                if (sentMessageIds.has(link.data.source) || sentMessageIds.has(link.data.target)) {
+                    return false;
+                }
+                return true;
+            });
+
+            // Translate remaining links to Matrix events (dev.ad4m.link.triple)
+            const remainingDiff: PerspectiveDiff = {
+                additions: nonMessageAdditions,
+                removals: diff.removals,
+            };
+            const events = diffToEvents(remainingDiff, {
                 settings,
                 hashFn: hash,
                 neighbourhoodUrl: neighbourhoodUrl(),
                 shouldFederate: federationFilter,
             });
 
-            // 6. Send events to the room
+            // Send events to the room
             for (const event of events) {
                 const txnId = generateTxnId();
                 await matrixApi.sendEvent(
@@ -381,17 +604,16 @@ const language = defineLanguage({
                 );
             }
 
-            // 7. Handle removals (redactions)
+            // Handle removals (redactions)
             for (const removal of diff.removals) {
                 const linkHash = store.hashLink(removal);
-                // Look up the Matrix event ID for this link
                 const eventId = store.getLinkHashByEventId(linkHash);
                 if (eventId) {
                     await matrixApi.redactEvent(MATRIX_ROOM_ID, eventId, "Link removed");
                 }
             }
 
-            // 8. Emit the perspective diff for local subscribers
+            // Emit the perspective diff for local subscribers
             emitPerspectiveDiff(diff);
 
             return "";
@@ -423,12 +645,14 @@ const language = defineLanguage({
                 return { additions: [], removals: [] };
             }
 
-            const diff = processSyncResponse(
-                syncResponse,
-                MATRIX_ROOM_ID,
-                neighbourhoodUrl(),
-                MATRIX_USER_ID,
-            );
+            // Update since token
+            if (syncResponse.next_batch) {
+                setSinceToken(syncResponse.next_batch);
+            }
+
+            // Extract room timeline
+            const room = syncResponse.rooms?.join?.[MATRIX_ROOM_ID];
+            const timelineEvents = room?.timeline?.events || [];
 
             // Process to-device events for telepresence signals
             if (syncResponse.to_device?.events) {
@@ -436,34 +660,103 @@ const language = defineLanguage({
             }
 
             // Process timeline events for broadcast signals
-            const room = syncResponse.rooms?.join?.[MATRIX_ROOM_ID];
-            if (room?.timeline?.events) {
-                processTimelineBroadcasts(room.timeline.events, MATRIX_USER_ID);
+            if (timelineEvents.length > 0) {
+                processTimelineBroadcasts(timelineEvents, MATRIX_USER_ID);
             }
 
-            // Build DID ↔ MXID mappings from incoming link events
-            if (room?.timeline?.events) {
-                for (const event of room.timeline.events) {
-                    if (event.type === "dev.ad4m.link.triple" && event.sender) {
-                        const content = event.content as Record<string, unknown>;
-                        const author = content.author as string;
-                        if (author && event.sender) {
-                            storeDIDMapping(author, event.sender);
-                        }
+            // ------------------------------------------------------------------
+            // FLUX-AWARE INBOUND PROCESSING
+            // Convert Matrix messages to Flux Message link sets
+            // ------------------------------------------------------------------
+
+            const allAdditions: LinkExpression[] = [];
+            const allRemovals: LinkExpression[] = [];
+
+            const channelId = getDefaultChannelId();
+
+            for (const event of timelineEvents) {
+                const eventId = event.event_id;
+                if (!eventId) continue;
+
+                // Skip events sent by our bridge user (echo suppression)
+                if (event.sender === MATRIX_USER_ID) continue;
+
+                // Skip already-processed events
+                const processedKey = `processed:${eventId}`;
+                if (getStorage().get(processedKey)) continue;
+                getStorage().put(processedKey, "1");
+
+                if (event.type === "m.room.message") {
+                    // Convert to Flux Message links
+                    const fluxLinks = matrixMessageToFluxLinks(event, channelId);
+                    if (fluxLinks.length > 0) {
+                        allAdditions.push(...fluxLinks);
+                        console.log(`[matrix-link-language] inbound Matrix message → Flux links (${fluxLinks.length} links)`);
+                    }
+                } else if (event.type === "dev.ad4m.link.triple") {
+                    // Standard link triple — convert directly
+                    const content = event.content as Record<string, unknown>;
+                    if (content && typeof content.source === "string") {
+                        allAdditions.push({
+                            author: (content.author as string) || `matrix:${event.sender || "unknown"}`,
+                            timestamp: (content.timestamp as string) || new Date(event.origin_server_ts || Date.now()).toISOString(),
+                            data: {
+                                source: content.source as string,
+                                target: (content.target as string) || "",
+                                predicate: (content.predicate as string) || "",
+                            },
+                            proof: {
+                                signature: (content.proof as any)?.signature || "",
+                                key: (content.proof as any)?.key || "",
+                            },
+                        });
+                    }
+                } else if (event.type === "m.room.redaction") {
+                    const redactedEventId = event.redacts || (event.content?.redacts as string);
+                    if (redactedEventId) {
+                        allRemovals.push({
+                            author: event.sender ? `matrix:${event.sender}` : "matrix:unknown",
+                            timestamp: new Date(event.origin_server_ts || Date.now()).toISOString(),
+                            data: {
+                                source: neighbourhoodUrl(),
+                                target: redactedEventId,
+                                predicate: "matrix://redacted",
+                            },
+                            proof: { signature: "", key: "" },
+                        });
+                    }
+                }
+
+                // Build DID ↔ MXID mappings
+                if (event.type === "dev.ad4m.link.triple" && event.sender) {
+                    const content = event.content as Record<string, unknown>;
+                    const author = content.author as string;
+                    if (author) {
+                        storeDIDMapping(author, event.sender);
                     }
                 }
             }
 
-            // Track origins for inbound links
-            for (const link of diff.additions) {
-                const h = store.hashLink(link);
-                const originKey = linkOriginKey(h);
-                const existing = getStorage().get(originKey);
-                if (existing === "native") {
-                    getStorage().put(originKey, "dual");
-                } else if (!existing) {
-                    getStorage().put(originKey, "matrix");
+            // Apply to store
+            const diff: PerspectiveDiff = { additions: allAdditions, removals: allRemovals };
+            if (allAdditions.length > 0 || allRemovals.length > 0) {
+                store.applyDiff(diff);
+
+                // Track origins for inbound links
+                for (const link of allAdditions) {
+                    const h = store.hashLink(link);
+                    const originKey = linkOriginKey(h);
+                    const existing = getStorage().get(originKey);
+                    if (existing === "native") {
+                        getStorage().put(originKey, "dual");
+                    } else if (!existing) {
+                        getStorage().put(originKey, "matrix");
+                    }
                 }
+
+                // CRITICAL: emit the diff so the executor persists
+                // inbound links in the perspective's SPARQL store.
+                emitPerspectiveDiff(diff);
             }
 
             return diff;
@@ -507,7 +800,6 @@ const language = defineLanguage({
         },
 
         async remote() {
-            // Remote peers are room members
             return store.listPeers("peers/");
         },
     },
@@ -527,7 +819,6 @@ const language = defineLanguage({
 
             await matrixApi.setPresence(matrixPresence, statusMsg);
 
-            // Also store our own DID ↔ MXID mapping
             if (myDid && MATRIX_USER_ID) {
                 storeDIDMapping(myDid, MATRIX_USER_ID);
             }
@@ -537,7 +828,6 @@ const language = defineLanguage({
             if (!configured) return [];
             await ensureConnected();
 
-            // Get room members
             const memberEvents = await matrixApi.getMembers(MATRIX_ROOM_ID);
             const members = parseMemberEvents(memberEvents);
             const joinedMembers = members.filter(m => m.membership === "join");
@@ -545,16 +835,12 @@ const language = defineLanguage({
             const onlineAgents: unknown[] = [];
 
             for (const member of joinedMembers) {
-                // Skip ourselves
                 if (member.userId === MATRIX_USER_ID) continue;
 
-                // Check presence
                 const presence = await matrixApi.getPresence(member.userId);
                 if (!presence) continue;
                 if (presence.presence !== "online") continue;
 
-                // Resolve DID — check our stored mapping first,
-                // then fall back to the convention-based mxidToDid
                 const did = getDidForMxid(member.userId) || mxidToDid(member.userId);
 
                 onlineAgents.push({
@@ -575,26 +861,20 @@ const language = defineLanguage({
             if (!configured) return { error: "not configured" };
             await ensureConnected();
 
-            // Resolve DID → MXID
             let targetMxid = getMxidForDid(remoteDid);
             if (!targetMxid) {
-                // Fall back to convention-based mapping
                 const serverName = extractServerName(MATRIX_USER_ID);
                 targetMxid = didToMxid(remoteDid, serverName);
             }
 
-            // Send via to-device message
             const content: Record<string, unknown> = {
                 sender_did: myDid,
                 payload,
                 timestamp: new Date().toISOString(),
             };
 
-            // Send to all devices of the target user ("*" = all devices)
             const messages: Record<string, Record<string, Record<string, unknown>>> = {
-                [targetMxid]: {
-                    "*": content,
-                },
+                [targetMxid]: { "*": content },
             };
 
             const success = await matrixApi.sendToDevice("dev.ad4m.signal", messages);
@@ -605,7 +885,6 @@ const language = defineLanguage({
             if (!configured) return { error: "not configured" };
             await ensureConnected();
 
-            // Send as a room event so all members receive it
             const content: Record<string, unknown> = {
                 sender_did: myDid,
                 payload,
@@ -661,14 +940,11 @@ export default language;
 // Template params metadata (for language.publish / LanguageMeta)
 // ---------------------------------------------------------------------------
 
-/**
- * List of template parameters this language expects.  Pass this as
- * `languageMeta.possibleTemplateParams` when publishing.
- */
 export const possibleTemplateParams: string[] = [
     "MATRIX_HOMESERVER_URL",
     "MATRIX_ROOM_ID",
     "MATRIX_USER_ID",
+    "MATRIX_ACCESS_TOKEN",
     "MATRIX_ROOM_ALIAS",
     "NEIGHBOURHOOD_META",
 ];
@@ -699,11 +975,6 @@ export function linkSyncAddSyncStateChangeCallback(callback: (state: string) => 
 // Signal-based event handler
 // ---------------------------------------------------------------------------
 
-/**
- * Handle signals emitted by the executor.
- *
- * The executor forwards inbound events as signals to the language.
- */
 export async function handleSignal(signalData: string): Promise<void> {
     let signal: unknown;
     try {
@@ -718,18 +989,22 @@ export async function handleSignal(signalData: string): Promise<void> {
     if (!event.type) return;
 
     // Process as a Matrix event
-    const { eventsToLinks: translate } = await import("./src/translate.js");
-    const diff = translate([event as any], neighbourhoodUrl());
+    const channelId = getDefaultChannelId();
+    let diff: PerspectiveDiff = { additions: [], removals: [] };
 
-    const combinedDiff: PerspectiveDiff = {
-        additions: diff.additions,
-        removals: diff.removals,
-    };
+    if (event.type === "m.room.message") {
+        const fluxLinks = matrixMessageToFluxLinks(event as MatrixEvent, channelId);
+        diff = { additions: fluxLinks, removals: [] };
+    } else {
+        // Standard event processing
+        const { eventsToLinks: translate } = await import("./src/translate.js");
+        diff = translate([event as any], neighbourhoodUrl());
+    }
 
-    if (combinedDiff.additions.length > 0 || combinedDiff.removals.length > 0) {
-        store.applyDiff(combinedDiff);
+    if (diff.additions.length > 0 || diff.removals.length > 0) {
+        store.applyDiff(diff);
         if (linkCallback) {
-            linkCallback(combinedDiff);
+            linkCallback(diff);
         }
     }
 }
