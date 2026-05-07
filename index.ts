@@ -272,6 +272,16 @@ function createSignedLink(source: string, predicate: string, target: string): Li
     // agentCreateSignedExpression signs with the bridge agent's key
     // Returns { author, timestamp, data, proof: { signature, key } }
     const signed = agentCreateSignedExpression(data);
+    if (!signed || !signed.author) {
+        console.error("[matrix-link-language] createSignedLink: agentCreateSignedExpression returned invalid result:", JSON.stringify(signed));
+        // Fallback: create a manually-structured link
+        return {
+            author: agentDid(),
+            timestamp: new Date().toISOString(),
+            data,
+            proof: { signature: "", key: "" },
+        } as unknown as LinkExpression;
+    }
     return signed as unknown as LinkExpression;
 }
 
@@ -370,7 +380,15 @@ function processToDeviceEvents(events: MatrixEvent[]): void {
     if (!telepresenceSignalCallback) return;
     for (const event of events) {
         if (event.type === "dev.ad4m.signal" || event.type === "dev.ad4m.broadcast") {
-            telepresenceSignalCallback(event.content);
+            // Wrap in PerspectiveExpression format for the executor
+            const wrapped = {
+                author: (event as any).sender ? mxidToDid((event as any).sender) : agentDid(),
+                timestamp: new Date((event as any).origin_server_ts || Date.now()).toISOString(),
+                data: { links: [] },
+                proof: { key: "", signature: "" },
+                signal: event.content,
+            };
+            telepresenceSignalCallback(wrapped);
         }
     }
 }
@@ -380,7 +398,18 @@ function processTimelineBroadcasts(events: MatrixEvent[], myUserId: string): voi
     for (const event of events) {
         if (event.type === "dev.ad4m.broadcast") {
             if (event.sender === myUserId) continue;
-            telepresenceSignalCallback(event.content);
+            // The executor's registered callback expects PerspectiveExpression format:
+            // { author, timestamp, data: { links: [...] }, proof: { key, signature } }
+            // Wrap the raw signal content in the proper structure.
+            const wrapped = {
+                author: event.sender ? mxidToDid(event.sender) : "did:matrix:unknown:anonymous",
+                timestamp: new Date(event.origin_server_ts || Date.now()).toISOString(),
+                data: { links: [] },
+                proof: { key: "", signature: "" },
+                // Attach original content as custom field for downstream handling
+                signal: event.content,
+            };
+            telepresenceSignalCallback(wrapped);
         }
     }
 }
@@ -786,6 +815,18 @@ const language = defineLanguage({
 
                 // CRITICAL: emit the diff so the executor persists
                 // inbound links in the perspective's SPARQL store.
+                // Validate all links before passing to Rust
+                for (const link of diff.additions) {
+                    if (!link.author || !link.data) {
+                        console.error("[matrix-link-language] INVALID LINK in additions:", JSON.stringify(link));
+                    }
+                }
+                for (const link of diff.removals) {
+                    if (!link.author || !link.data) {
+                        console.error("[matrix-link-language] INVALID LINK in removals:", JSON.stringify(link));
+                    }
+                }
+                console.log(`[matrix-link-language] emitting diff: ${diff.additions.length} additions, ${diff.removals.length} removals`);
                 emitPerspectiveDiff(diff);
             }
 
