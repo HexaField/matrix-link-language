@@ -816,13 +816,20 @@ export function parseMemberEvents(events: MatrixEvent[]): RoomMember[] {
 
 /**
  * Map a Matrix user ID to an AD4M DID.
+ * AD4M bridge users: @_ad4m_<key>:server → did:key:<key>
+ * Regular Matrix users: @user:server → did:matrix:server:user
  */
 export function mxidToDid(mxid: string): string {
     const ad4mMatch = mxid.match(/^@_ad4m_(.+?):/);
     if (ad4mMatch) {
         return `did:key:${ad4mMatch[1]}`;
     }
-    return `matrix:${mxid}`;
+    // Proper DID format: @user:server → did:matrix:server:user
+    const match = mxid.match(/^@([^:]+):(.+)$/);
+    if (match) {
+        return `did:matrix:${match[2]}:${match[1]}`;
+    }
+    return `did:matrix:unknown:${mxid.replace('@', '')}`;
 }
 
 /**
@@ -830,13 +837,22 @@ export function mxidToDid(mxid: string): string {
  */
 export function didToMxid(did: string, serverName: string): string {
     if (did.startsWith("matrix:")) {
-        return did.slice(7);
+        return did.slice(7);  // legacy format
+    }
+    if (did.startsWith("did:matrix:")) {
+        // did:matrix:server:user → @user:server
+        const parts = did.slice(11).split(':');
+        if (parts.length >= 2) {
+            const server = parts[0];
+            const user = parts.slice(1).join(':');
+            return `@${user}:${server}`;
+        }
     }
     if (did.startsWith("did:key:")) {
         const suffix = did.slice(8);
         return `@_ad4m_${suffix}:${serverName}`;
     }
-    return `@_ad4m_${encodeURIComponent(did)}:${serverName}`;
+    return `@${did}:${serverName}`;
 }
 
 /**

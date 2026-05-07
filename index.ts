@@ -259,8 +259,26 @@ function detectFluxMessages(additions: LinkExpression[]): FluxMessageInfo[] {
     return messages;
 }
 
+// ---------------------------------------------------------------------------
+// Signed Link Creation (Fix #5: all inbound links signed by bridge agent)
+// ---------------------------------------------------------------------------
+
+/**
+ * Create a properly signed link using the bridge agent's DID and key.
+ * The executor requires valid `did:key:` signatures to accept links.
+ */
+function createSignedLink(source: string, predicate: string, target: string): LinkExpression {
+    const data = { source, predicate, target };
+    // agentCreateSignedExpression signs with the bridge agent's key
+    // Returns { author, timestamp, data, proof: { signature, key } }
+    const signed = agentCreateSignedExpression(data);
+    return signed as unknown as LinkExpression;
+}
+
 /**
  * Convert a Matrix m.room.message into a set of Flux Message links.
+ * All links are signed by the bridge agent (Fix #1 & #5).
+ * Original Matrix sender preserved via attribution link.
  */
 function matrixMessageToFluxLinks(
     event: MatrixEvent,
@@ -276,54 +294,27 @@ function matrixMessageToFluxLinks(
     const ad4m = content.ad4m as Record<string, unknown> | undefined;
     if (ad4m) return [];
 
-    const timestamp = event.origin_server_ts
-        ? new Date(event.origin_server_ts).toISOString()
-        : new Date().toISOString();
-
-    const author = event.sender
+    // Preserve original Matrix sender as did:matrix: DID
+    const originalAuthor = event.sender
         ? mxidToDid(event.sender)
-        : "matrix:unknown";
+        : "did:matrix:unknown:anonymous";
 
     // Generate a stable message ID from the Matrix event ID
     const messageId = `matrix-msg://${event.event_id || Date.now()}`;
 
     const links: LinkExpression[] = [];
 
-    // 1. Channel → Message (has_child) — the core parent-child relationship
-    links.push({
-        author,
-        timestamp,
-        data: {
-            source: channelId,
-            target: messageId,
-            predicate: FLUX.HAS_CHILD,
-        },
-        proof: { signature: "", key: "" },
-    });
+    // 1. Channel → Message (has_child) — signed by bridge agent
+    links.push(createSignedLink(channelId, FLUX.HAS_CHILD, messageId));
 
-    // 2. Message type flag
-    links.push({
-        author,
-        timestamp,
-        data: {
-            source: messageId,
-            target: FLUX.HAS_MESSAGE,
-            predicate: FLUX.ENTRY_TYPE,
-        },
-        proof: { signature: "", key: "" },
-    });
+    // 2. Message type flag — signed by bridge agent
+    links.push(createSignedLink(messageId, FLUX.ENTRY_TYPE, FLUX.HAS_MESSAGE));
 
-    // 3. Message body
-    links.push({
-        author,
-        timestamp,
-        data: {
-            source: messageId,
-            target: toLiteralString(body),
-            predicate: FLUX.BODY,
-        },
-        proof: { signature: "", key: "" },
-    });
+    // 3. Message body — signed by bridge agent
+    links.push(createSignedLink(messageId, FLUX.BODY, toLiteralString(body)));
+
+    // 4. Attribution link — preserves the original Matrix author
+    links.push(createSignedLink(messageId, "matrix://original_sender", originalAuthor));
 
     return links;
 }
@@ -492,7 +483,7 @@ const language = defineLanguage({
                 store.applyDiff(diff);
                 trackChannels(diff.additions);
                 emitPerspectiveDiff(diff);
-                return "";
+                return getSinceToken() || hash(JSON.stringify(diff));
             }
 
             // 0b. Ensure we are connected before sending
@@ -510,7 +501,7 @@ const language = defineLanguage({
             // 2. Skip outbound in subscribe-only mode
             if (settings.syncMode === "subscribe-only") {
                 emitPerspectiveDiff(diff);
-                return "";
+                return getSinceToken() || hash(JSON.stringify(diff));
             }
 
             // ------------------------------------------------------------------
@@ -581,9 +572,54 @@ const language = defineLanguage({
                 return true;
             });
 
+            // ------------------------------------------------------------------
+            // OUTBOUND WHITELIST FILTER (Fix #2)
+            // Only federate Flux messages (handled above) to Matrix.
+            // All other links (SDNA, schema, structural) stay local.
+            // ------------------------------------------------------------------
+            const federableAdditions = nonMessageAdditions.filter(link => {
+                const pred = link.data.predicate || "";
+                const source = link.data.source || "";
+                const target = link.data.target || "";
+
+                // NEVER send SDNA/SHACL links
+                if (pred.includes("ad4m://shacl") || pred.includes("ad4m://SubjectClass") || pred.includes("rdf://type")) {
+                    return false;
+                }
+                // NEVER send ontology predicates
+                if (pred.startsWith("ad4m://ontology/")) {
+                    return false;
+                }
+                // NEVER send schema/shape links
+                if (source.endsWith("Shape") || target.endsWith("Shape")) {
+                    return false;
+                }
+                // NEVER send entry type markers
+                if (pred === FLUX.ENTRY_TYPE) {
+                    return false;
+                }
+                // NEVER send channel structure
+                if (pred === FLUX.HAS_CHANNEL || pred === FLUX.CHANNEL_NAME || pred === FLUX.HAS_COMMUNITY || pred === FLUX.NAME) {
+                    return false;
+                }
+                // NEVER send flux://body links that weren't part of a detected message
+                // (they were already handled in the Flux message detection above)
+                if (pred === FLUX.BODY) {
+                    return false;
+                }
+                // NEVER send has_child links (structural hierarchy)
+                if (pred === FLUX.HAS_CHILD) {
+                    return false;
+                }
+
+                // Default: don't send to Matrix (whitelist approach)
+                // Only Flux messages (already sent above) go to Matrix.
+                return false;
+            });
+
             // Translate remaining links to Matrix events (dev.ad4m.link.triple)
             const remainingDiff: PerspectiveDiff = {
-                additions: nonMessageAdditions,
+                additions: federableAdditions,
                 removals: diff.removals,
             };
             const events = diffToEvents(remainingDiff, {
@@ -616,7 +652,8 @@ const language = defineLanguage({
             // Emit the perspective diff for local subscribers
             emitPerspectiveDiff(diff);
 
-            return "";
+            // Fix #3: Return a meaningful revision string
+            return getSinceToken() || hash(JSON.stringify(diff));
         },
     },
 
@@ -694,22 +731,15 @@ const language = defineLanguage({
                         console.log(`[matrix-link-language] inbound Matrix message → Flux links (${fluxLinks.length} links)`);
                     }
                 } else if (event.type === "dev.ad4m.link.triple") {
-                    // Standard link triple — convert directly
+                    // Standard link triple — sign with bridge agent key
                     const content = event.content as Record<string, unknown>;
                     if (content && typeof content.source === "string") {
-                        allAdditions.push({
-                            author: (content.author as string) || `matrix:${event.sender || "unknown"}`,
-                            timestamp: (content.timestamp as string) || new Date(event.origin_server_ts || Date.now()).toISOString(),
-                            data: {
-                                source: content.source as string,
-                                target: (content.target as string) || "",
-                                predicate: (content.predicate as string) || "",
-                            },
-                            proof: {
-                                signature: (content.proof as any)?.signature || "",
-                                key: (content.proof as any)?.key || "",
-                            },
-                        });
+                        const signedLink = createSignedLink(
+                            content.source as string,
+                            (content.predicate as string) || "",
+                            (content.target as string) || "",
+                        );
+                        allAdditions.push(signedLink);
                     }
                 } else if (event.type === "m.room.redaction") {
                     const redactedEventId = event.redacts || (event.content?.redacts as string);
@@ -993,7 +1023,7 @@ export async function handleSignal(signalData: string): Promise<void> {
     let diff: PerspectiveDiff = { additions: [], removals: [] };
 
     if (event.type === "m.room.message") {
-        const fluxLinks = matrixMessageToFluxLinks(event as MatrixEvent, channelId);
+        const fluxLinks = matrixMessageToFluxLinks(event as unknown as MatrixEvent, channelId);
         diff = { additions: fluxLinks, removals: [] };
     } else {
         // Standard event processing
